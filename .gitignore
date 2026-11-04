@@ -1,0 +1,16 @@
+.vscode/
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+.env*
+!.env.example
+Digraph.gv
+Digraph.gv.pdf
+TODO.txt
