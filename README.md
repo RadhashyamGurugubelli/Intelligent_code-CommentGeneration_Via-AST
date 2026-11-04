@@ -11,25 +11,16 @@ text; it is not executed by the analysis or agent workflows.
 ### System overview
 
 ```mermaid
-flowchart LR
-    Browser["Browser UI<br/>HTML / CSS / JavaScript"]
-    Flask["Flask app<br/>backend.app"]
-    Routes["Route blueprints<br/>HTTP validation and responses"]
-    Analysis["Analysis services<br/>AST / types / rules / validation"]
-    Agents["Agent workflows<br/>bounded analysis and orchestration"]
-    Provider["Model provider<br/>optional external or local model"]
-    Graph["AST PDF renderer<br/>Graphviz"]
-
-    Browser -->|"JSON requests"| Flask
-    Flask --> Routes
-    Routes --> Analysis
-    Routes --> Agents
+flowchart TD
+    Browser[Browser UI] -->|HTTP requests| Flask[Flask application]
+    Flask --> Routes[API route blueprints]
+    Routes --> Analysis[AST analysis and validation]
+    Routes --> Agents[Agent workflows]
     Agents --> Analysis
-    Routes -. "model-backed features" .-> Provider
-    Agents -. "model-backed steps" .-> Provider
-    Routes -. "AST PDF request" .-> Graph
-    Routes -->|"JSON or PDF response"| Browser
-    Flask -->|"index.html and static assets"| Browser
+    Routes -.-> Provider[Optional model provider]
+    Agents -.-> Provider
+    Routes -.-> Graphviz[Optional Graphviz PDF renderer]
+    Flask -->|HTML and static assets| Browser
 ```
 
 ### Main code paths
