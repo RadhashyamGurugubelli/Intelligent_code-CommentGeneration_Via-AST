@@ -150,9 +150,18 @@ class SessionManager:
         self._sessions: Dict[str, AgentSession] = {}
         self._lock = threading.Lock()
         self.default_ttl = default_ttl_seconds
+        self._last_reap = time.time()
+
+    def _maybe_cleanup(self) -> None:
+        """Opportunistically reap expired sessions if interval elapsed."""
+        now = time.time()
+        if now - self._last_reap >= 60.0:
+            self._last_reap = now
+            self.cleanup_expired()
 
     def create_session(self, code: str, task: str = "") -> AgentSession:
         """Create and register a new stateful AgentSession."""
+        self._maybe_cleanup()
         session_id = str(uuid.uuid4())
         digest = hashlib.sha256(code.encode("utf-8")).hexdigest()
         session = AgentSession(
@@ -168,6 +177,7 @@ class SessionManager:
 
     def get_session(self, session_id: str) -> Optional[AgentSession]:
         """Fetch session by ID."""
+        self._maybe_cleanup()
         with self._lock:
             return self._sessions.get(session_id)
 

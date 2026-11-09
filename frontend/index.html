@@ -344,6 +344,59 @@
                             </div>
                         </div>
 
+                        <!-- Professor-Student Pedagogical Review Studio Card -->
+                        <div class="agent-sub-section professor-student-panel" id="professor-student-panel" style="background: rgba(15, 23, 42, 0.7); border: 1px solid rgba(168, 85, 247, 0.3); border-radius: var(--radius-md); padding: 18px; margin-bottom: 20px;">
+                            <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:14px;">
+                                <div>
+                                    <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+                                        <span class="badge purple">Pedagogical QA Loop</span>
+                                        <span class="badge" id="prof-loop-status">Ready</span>
+                                    </div>
+                                    <strong style="font-size:1.05rem; color:#f8fafc;">🎓 Professor-Student Continuous Review & Remediation</strong>
+                                    <p style="color:var(--text-muted); font-size:0.82rem; margin:4px 0 0;">Iterative academic audit enforcing zero syntax errors, zero security sinks, low complexity, and clean docstrings. The Student continuously remediates until Grade A or perfection is achieved.</p>
+                                </div>
+                                <div style="display:flex; gap:10px; align-items:center;">
+                                    <label for="prof-max-iterations" style="font-size:0.8rem; color:var(--text-secondary); white-space:nowrap;">Max Iterations:</label>
+                                    <select id="prof-max-iterations" style="padding:4px 8px; font-size:0.8rem;">
+                                        <option value="3">3 Iterations</option>
+                                        <option value="5" selected>5 Iterations</option>
+                                        <option value="8">8 Iterations</option>
+                                        <option value="10">10 Iterations</option>
+                                    </select>
+                                    <button id="btn-run-professor-student" class="btn-primary" type="button" style="white-space:nowrap;">
+                                        Run Pedagogical Loop
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Output Box for Professor Student Loop -->
+                            <div id="prof-student-results" style="display:none; margin-top:16px;">
+                                <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; background:rgba(30, 41, 59, 0.6); border-radius:var(--radius-sm); border:1px solid var(--border-subtle); margin-bottom:14px;">
+                                    <div style="display:flex; gap:12px; align-items:center;">
+                                        <span id="prof-final-grade-badge" class="badge" style="font-size:1rem; padding:4px 10px; font-weight:700;">Grade -</span>
+                                        <span id="prof-final-score-text" style="font-size:0.9rem; font-weight:600; color:#e2e8f0;">Score: 0/100</span>
+                                        <span id="prof-iterations-count" class="badge">0 iterations</span>
+                                    </div>
+                                    <span id="prof-approval-pill" class="badge">Evaluating</span>
+                                </div>
+                                <p id="prof-summary-text" style="font-size:0.85rem; color:#94a3b8; margin-bottom:14px;"></p>
+
+                                <!-- Iterations Timeline Accordion -->
+                                <div id="prof-timeline-container" style="display:flex; flex-direction:column; gap:8px; margin-bottom:16px;"></div>
+
+                                <!-- Diff & Apply Box -->
+                                <div id="prof-diff-box" style="display:none;">
+                                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                                        <strong style="font-size:0.88rem; color:#38bdf8;">Professor-Approved Unified Diff</strong>
+                                        <button id="btn-apply-prof-code" class="btn-primary btn-small" type="button">
+                                            Apply Approved Code to Active Editor
+                                        </button>
+                                    </div>
+                                    <div id="prof-diff-container" class="diff-container" style="max-height:300px; overflow-y:auto; border:1px solid var(--border-subtle); border-radius:var(--radius-sm); padding:8px; background:#0b0f19;"></div>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- Specialist Individual Agent Grid -->
                         <div class="agent-specialist-grid">
                             <button id="btn-agent-optimize" type="button" class="agent-card-btn">

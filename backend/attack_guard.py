@@ -99,20 +99,27 @@ def detect_attack(text, *, content_type="prompt"):
 
     if content_type == "code":
         lowered = text.lower()
-        sensitive_source = any(
-            marker in lowered
-            for marker in (
-                "os.environ",
-                "os.getenv",
-                "path.home",
-                "expanduser",
-                ".env",
-                "contacts.csv",
-                "personal_data",
-                "private_data",
-                "customer_data",
-                "credit_card",
-                "ssn",
+        sensitive_source = (
+            "os.environ" in lowered
+            or any(
+                marker in lowered
+                for marker in (
+                    "path.home",
+                    "expanduser",
+                    ".env",
+                    "contacts.csv",
+                    "personal_data",
+                    "private_data",
+                    "customer_data",
+                    "credit_card",
+                    "ssn",
+                )
+            )
+            or bool(
+                re.search(
+                    r"os\.getenv\s*\(\s*['\"][^'\"]*(?:key|secret|token|pass|cred|auth|private)",
+                    lowered,
+                )
             )
         )
         outbound_sink = any(
@@ -149,10 +156,10 @@ def detect_attack(text, *, content_type="prompt"):
         if re.search(r"re\.(?:compile|search|match|findall|sub)\s*\([^)]*?\([^)]*?[+*][^)]*?\)[+*]", text):
             findings.append({"category": "redos_risk", "severity": "medium"})
 
-        # SSRF Unvalidated Outbound Request
+        # SSRF Unvalidated Outbound Request (do not suppress on insecure verify=False)
         if (
             ("requests.get" in lowered or "requests.post" in lowered or "urlopen" in lowered)
-            and not any(marker in lowered for marker in ("http://", "https://", "startswith", "urlparse", "verify=false", "verify = false"))
+            and not any(marker in lowered for marker in ("http://", "https://", "startswith", "urlparse"))
         ):
             findings.append({"category": "ssrf_risk", "severity": "high"})
 

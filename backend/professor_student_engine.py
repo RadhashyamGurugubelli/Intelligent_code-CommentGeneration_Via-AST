@@ -48,16 +48,13 @@ class ProfessorStudentOrchestrator:
             }
 
         warnings = _warnings_for(code)
-        quality = summarize_quality(warnings)
-        base_score = quality["score"]
 
         # Run static security check
         sec_result = simulate_attacks(code, model_client=self.model_client)
         sec_findings = sec_result.get("vulnerabilities_detected", 0)
 
-        # Inspect AST structure
+        # Inspect AST structure for complexity and docstrings
         ast_data = analyze_code(code)
-        functions_missing_docs = []
         for fn in ast_data.get("functions", []):
             if fn.get("complexity", 1) > 8:
                 warnings.append({
@@ -65,7 +62,15 @@ class ProfessorStudentOrchestrator:
                     "severity": "warning",
                     "message": f"High cyclomatic complexity in {fn.get('name')}() (CC={fn.get('complexity')})",
                 })
+            if not fn.get("docstring"):
+                warnings.append({
+                    "rule_id": "DOC001",
+                    "severity": "warning",
+                    "message": f"Missing docstring specification in function {fn.get('name')}()",
+                })
 
+        quality = summarize_quality(warnings)
+        base_score = quality["score"]
         deductions = sec_findings * 25
         final_score = max(0, min(100, base_score - deductions))
         grade = self._grade_from_score(final_score)
@@ -75,7 +80,7 @@ class ProfessorStudentOrchestrator:
             critiques.append(
                 f"Security Vulnerability: Identified {sec_findings} vulnerable sink(s). Neutralize immediately."
             )
-        for w in warnings[:4]:
+        for w in warnings[:5]:
             critiques.append(f"{w.get('rule_id', 'Lint')}: {w.get('message')}")
 
         if not critiques and final_score >= 90:
@@ -91,36 +96,45 @@ class ProfessorStudentOrchestrator:
         }
 
     def student_revise(self, code: str, critique: List[str], iteration: int) -> str:
-        """Student synthesizes improvements addressing the Professor's critique."""
+        """Student synthesizes improvements addressing the Professor's critique with safety checks."""
         candidate = code
 
         # 1. Remediate security sinks if flagged
         if any("Security" in c for c in critique):
-            fix_res = fix_attack_vulnerabilities(candidate, model_client=self.model_client)
-            if fix_res.get("fixed") and fix_res.get("fixed_code"):
-                candidate = fix_res["fixed_code"]
+            try:
+                fix_res = fix_attack_vulnerabilities(candidate, model_client=self.model_client)
+                if fix_res.get("fixed") and fix_res.get("fixed_code"):
+                    fixed = fix_res["fixed_code"]
+                    if validate_code(fixed) is True:
+                        candidate = fixed
+            except Exception as exc:
+                logger.debug("Security fix step failed: %s", exc)
 
         # 2. Improve code quality / rules
         try:
             imp_res = improve_code_quality(candidate, model_client=self.model_client)
             if imp_res.get("improved") and imp_res.get("improved_code"):
-                candidate = imp_res["improved_code"]
+                improved = imp_res["improved_code"]
+                if validate_code(improved) is True:
+                    candidate = improved
         except Exception as exc:
             logger.debug("Code improver step skipped: %s", exc)
 
         # 3. Add clean AST docstrings if lacking
         try:
             ast_info = analyze_code(candidate)
-            doc_code = _fallback_comment_code(candidate, analysis=ast_info)
-            if validate_code(doc_code) is True:
-                candidate = doc_code
-        except Exception:
-            pass
+            needs_docs = any(not fn.get("docstring") for fn in ast_info.get("functions", []))
+            if needs_docs:
+                doc_code = _fallback_comment_code(candidate, analysis=ast_info)
+                if validate_code(doc_code) is True:
+                    candidate = doc_code
+        except Exception as exc:
+            logger.debug("Docstring generation step skipped: %s", exc)
 
         return candidate
 
     def run(self, source_code: str) -> Dict[str, Any]:
-        """Execute the continuous feedback loop until approval or max_iterations reached."""
+        """Execute the continuous feedback loop with monotonic best-score rollback."""
         valid = validate_code(source_code)
         if valid is not True:
             return {
@@ -131,6 +145,8 @@ class ProfessorStudentOrchestrator:
 
         history = []
         current_code = source_code
+        best_code = current_code
+        best_eval = self.professor_evaluate(current_code)
 
         for i in range(1, self.max_iterations + 1):
             eval_res = self.professor_evaluate(current_code)
@@ -143,6 +159,10 @@ class ProfessorStudentOrchestrator:
                 "critique": eval_res["critique"],
             })
 
+            if eval_res["score"] >= best_eval["score"]:
+                best_code = current_code
+                best_eval = eval_res
+
             if eval_res["passed"] or i >= self.max_iterations:
                 break
 
@@ -150,13 +170,21 @@ class ProfessorStudentOrchestrator:
             if revised == current_code:
                 # No further automated revision possible
                 break
+
+            # Validate revised syntax before accepting into loop
+            if validate_code(revised) is not True:
+                logger.warning("Student revision generated invalid syntax; reverting to best checkpoint.")
+                break
+
             current_code = revised
 
-        final_eval = history[-1]
+        # Ensure we return the best approved/scoring checkpoint
+        final_code = best_code
+        final_eval = best_eval
         diff = "\n".join(
             difflib.unified_diff(
                 source_code.splitlines(),
-                current_code.splitlines(),
+                final_code.splitlines(),
                 fromfile="Initial Submission",
                 tofile="Professor Approved",
                 lineterm="",
@@ -168,10 +196,10 @@ class ProfessorStudentOrchestrator:
             "iterations_count": len(history),
             "approved": final_eval["passed"],
             "initial_code": source_code,
-            "final_code": current_code,
+            "final_code": final_code,
             "final_grade": final_eval["grade"],
             "final_score": final_eval["score"],
-            "code_modified": current_code != source_code,
+            "code_modified": final_code != source_code,
             "diff": diff,
             "iterations": history,
             "summary": (

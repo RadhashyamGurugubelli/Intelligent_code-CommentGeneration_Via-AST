@@ -2876,3 +2876,67 @@ button {
 @keyframes spin {
     to { transform: rotate(360deg); }
 }
+
+
+/* Professor-Student Pedagogical Studio */
+.prof-iteration-card {
+    background: rgba(30, 41, 59, 0.5);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-sm);
+    padding: 10px 14px;
+    transition: border-color var(--transition-fast);
+}
+
+.prof-iteration-card:hover {
+    border-color: rgba(168, 85, 247, 0.35);
+}
+
+.prof-iteration-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+.prof-critique-list {
+    margin: 6px 0 0;
+    padding-left: 18px;
+    font-size: 0.8rem;
+    color: #94a3b8;
+}
+
+.prof-critique-list li {
+    margin-bottom: 4px;
+}
+
+.prof-grade-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-weight: 700;
+    font-size: 0.82rem;
+}
+
+.prof-grade-a {
+    background: rgba(16, 185, 129, 0.18);
+    color: #34d399;
+    border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.prof-grade-b {
+    background: rgba(56, 189, 248, 0.18);
+    color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.35);
+}
+
+.prof-grade-c {
+    background: rgba(250, 204, 21, 0.18);
+    color: #facc15;
+    border: 1px solid rgba(250, 204, 21, 0.35);
+}
+
+.prof-grade-df {
+    background: rgba(244, 63, 94, 0.18);
+    color: #f87171;
+    border: 1px solid rgba(244, 63, 94, 0.35);
+}

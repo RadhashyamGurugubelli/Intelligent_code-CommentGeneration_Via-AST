@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from flask import Blueprint, Response, current_app, jsonify, request
@@ -28,6 +28,7 @@ _runtime = AgentRuntime(
     model_client=create_model_client(),
     event_callback=default_broadcaster.emit,
 )
+_agent_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="agentic-worker")
 
 
 def _request_data():
@@ -82,13 +83,8 @@ def run_agentic_workflow_route():
         return jsonify({"error": f"Failed to initialize session: {exc}"}), 500
 
     if is_async:
-        # Launch background execution worker
-        worker = threading.Thread(
-            target=_runtime.execute_session,
-            args=(session.session_id,),
-            daemon=True,
-        )
-        worker.start()
+        # Launch bounded background execution worker
+        _agent_executor.submit(_runtime.execute_session, session.session_id)
         return jsonify({
             "status": "accepted",
             "session_id": session.session_id,

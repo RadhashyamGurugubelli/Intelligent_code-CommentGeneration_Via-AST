@@ -640,9 +640,31 @@ def agent_professor_student_route():
     if len(code) > current_app.config["MAX_SOURCE_LENGTH"]:
         return jsonify({"error": "Payload Too Large"}), 413
 
+    # Security pre-scan against adversarial prompt injection / policy bypass
+    attack_detection = _scan_assistant_input("", code)
+    if attack_detection["detected"]:
+        _log_blocked_attack("/agent/professor-student", attack_detection)
+        return jsonify(
+            {
+                "error": "Professor-Student review blocked by the security layer.",
+                "security_blocked": True,
+                "attack_detection": attack_detection,
+            }
+        ), 422
+
+    valid = validate_code(code)
+    if valid is not True:
+        formatted = format_python_error(code)
+        return jsonify(
+            {
+                "error": f"Syntax error in your code: {valid}",
+                "interpreter_output": formatted,
+            }
+        ), 400
+
     max_iterations = data.get("max_iterations", 5)
     try:
-        max_iterations = int(max_iterations)
+        max_iterations = max(1, min(10, int(max_iterations)))
     except (ValueError, TypeError):
         max_iterations = 5
 

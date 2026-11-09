@@ -164,7 +164,7 @@ def improve_code_quality(source_code, model_client):
                 ),
             )
             last_rejection = (
-                "Candidate rejected because it introduced adversarial instructions "
+                "Candidate rejected because it introduced additional security findings "
                 "or a new security risk."
             )
             break
