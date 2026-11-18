@@ -93,6 +93,9 @@ def hermetic_environment(monkeypatch, request):
     monkeypatch.setattr(AppConfig, "ANTHROPIC_API_KEY", "")
     monkeypatch.setattr(backend_config, "_resolve_github_token", lambda: "")
 
+    from backend.security_rate_limit import default_rate_limiter
+    default_rate_limiter.reset()
+
     def guarded_getaddrinfo(host, port, *args, **kwargs):
         if (
             request.node.get_closest_marker("allow_network")
@@ -117,4 +120,6 @@ def hermetic_environment(monkeypatch, request):
         )
 
     monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
+    yield
+    default_rate_limiter.reset()
 

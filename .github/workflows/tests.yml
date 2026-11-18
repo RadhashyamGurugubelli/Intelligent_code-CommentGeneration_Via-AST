@@ -76,4 +76,4 @@ jobs:
         run: python -m playwright install --with-deps chromium
 
       - name: Run Playwright browser tests
-        run: python -m pytest -q --run-browser-tests
+        run: python -m pytest -q --run-browser-tests tests/test_frontend_audit_renderer.py tests/test_nexus_ui_states.py tests/test_production_e2e_frontend.py

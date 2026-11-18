@@ -117,21 +117,24 @@ class TestAgenticWorkflowService(unittest.TestCase):
     def test_cancel_session_and_tickets(self):
         req = WorkflowRunRequest(
             code=self.sample_code,
-            task="Cancellation test",
+            task="Scan code for security vulnerabilities",
+            intent="security_scan",
             async_run=True,
             execution_mode="deterministic",
         )
-        resp, token, _ = self.service.start_workflow(req)
-        session = self.session_manager.get_session(resp.session_id)
-        self.assertIsNotNone(session)
+        with patch.object(self.service.runtime, "execute_session"):
+            resp, token, _ = self.service.start_workflow(req)
+            session = self.session_manager.get_session(resp.session_id)
+            self.assertIsNotNone(session)
 
-        # Generate ticket
-        ticket_resp = self.service.create_sse_ticket(session)
-        self.assertTrue(ticket_resp.ticket.startswith("sse_"))
+            # Generate ticket
+            ticket_resp = self.service.create_sse_ticket(session)
+            self.assertTrue(ticket_resp.ticket.startswith("sse_"))
 
-        # Cancel
-        cancel_res, code = self.service.cancel_session(resp.session_id)
-        self.assertIn(code, (202, 200))
+            # Cancel
+            cancel_res, code = self.service.cancel_session(resp.session_id)
+            self.assertIn(code, (202, 200))
+            self.assertEqual(cancel_res["status"], "cancellation_requested")
 
 
 if __name__ == "__main__":
