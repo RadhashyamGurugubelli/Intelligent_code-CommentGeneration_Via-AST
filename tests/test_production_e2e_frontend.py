@@ -586,7 +586,6 @@ class TestFrontendE2E:
     def test_offline_mode_and_zero_remote_traffic(self, live_server: str, browser_context, tmp_path):
         """Verify the app functions completely offline with all remote traffic blocked."""
         import os
-        from pathlib import Path
 
         page = browser_context.new_page()
         remote_requests = []
