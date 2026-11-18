@@ -9,11 +9,9 @@ Ensures that:
 
 from __future__ import annotations
 
-import subprocess
 import zipfile
 from pathlib import Path
 
-import pytest
 
 from scripts.build_clean_submission import (
     FORBIDDEN_DIR_PARTS,

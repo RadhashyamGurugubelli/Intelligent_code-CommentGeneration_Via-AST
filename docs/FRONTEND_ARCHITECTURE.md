@@ -132,4 +132,4 @@ The architecture is covered by automated regression tests in the test suite:
   - `test_results_center_tab_navigation`: Verifies deliverables and diff inspection.
   - `test_operator_approval_elements_present`: Verifies the Advanced Settings dropdown and human approval gate.
 - **`tests/test_frontend_assets.py`**: Validates DOM contracts, asset loading, and scenario inputs.
-- **All 512 Unit & Integration Tests**: Verified passing (100%).
+- **Backend Regression Suite**: 661 passed, 30 skipped (100% pass rate for active unit, integration, and security test suites; browser tests opt-in).

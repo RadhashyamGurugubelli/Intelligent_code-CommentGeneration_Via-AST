@@ -48,7 +48,7 @@ audit does not treat them as changes made for this task.
 
 - Latest full default-suite run:
   `.venv\Scripts\python.exe -m pytest -q --durations=12`
-- Result: **609 passed, 28 skipped in 29.01s** (637 tests collected). The slowest test was 1.58s; the former slow agentic API tests are now deterministic and avoid live-provider retries.
+- Result: **661 passed, 30 skipped in 21.03s** (691 tests collected). The slowest test was 1.58s; the former slow agentic API tests are now deterministic and avoid live-provider retries.
 - The long-running full-suite failure was in Playwright initialization, not the application tests: `sync_playwright()` blocked before Chrome launched on this Windows/Python 3.15 environment. Browser modules are now opt-in via `pytest --run-browser-tests`; their behavior remains unverified here.
 - A static scan found no visible ID-bearing HTML button lacking a script reference; the unmatched `btn-format` is explicitly disabled, and `btn-close-inspector` is hidden. This confirms source wiring only, not click behavior.
 - The integrated browser timed out connecting to the local Flask server, and the desktop browser did not produce a targetable window. No workaround or successful browser interaction is claimed.

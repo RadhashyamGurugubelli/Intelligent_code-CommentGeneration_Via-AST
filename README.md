@@ -74,7 +74,7 @@ flowchart LR
     Parser --> CST["Concrete Syntax Tree (Parse Tree)"]
     CST --> AST["Abstract Syntax Tree (ast.AST)"]
     AST --> SymTab["Symbol Table Analysis (symtable)"]
-    AST --> CFG["Control Flow Graph & Complexity"]
+    AST --> Complexity["AST-Derived Complexity & Metrics"]
     AST --> Quality["Type & Security Heuristics"]
     AST --> Scribe["Grounded Docstring Generation"]
 ```
@@ -92,10 +92,10 @@ where $V$ represents syntax nodes (e.g., `FunctionDef`, `Assign`, `BinOp`, `Call
 ### C. Symbol Table & Scope Resolution
 Using Python's standard `symtable` module, the engine models lexical scoping rules (Local, Enclosing, Global, Built-in — LEGB) across blocks, nested functions, and class definitions, identifying undeclared variables and shadowed symbols without runtime execution.
 
-### D. Control Flow Graph (CFG) & Cyclomatic Complexity
-Cyclomatic complexity $M$ evaluates the number of linearly independent paths through program modules:
-$$M = E - N + 2P$$
-Where $E$ is the number of edges in the control flow graph, $N$ is the number of nodes, and $P$ is the number of connected components ($P=1$ for a single function). In AST Studio, decision nodes (`If`, `For`, `While`, `ExceptHandler`, `With`, `Assert`, boolean operators `And`/`Or`) are traversed via `ast.NodeVisitor` to compute exact complexity scores.
+### D. AST-Derived Cyclomatic Complexity Estimation
+Cyclomatic complexity evaluates the number of linearly independent execution paths through program modules. Rather than constructing a full control flow graph (CFG), AST Studio calculates an **AST-derived complexity estimate** by systematically counting syntactic decision points directly on the abstract syntax tree:
+$$M = 1 + \sum d_i$$
+where $d_i$ represents decision nodes: branching constructs (`If`, `IfExp`), loop headers (`For`, `AsyncFor`, `While`), exception handlers (`ExceptHandler`), context managers (`With`, `AsyncWith`), pattern-matching branches (`match_case` and pattern guards), assertions (`Assert`), and chained boolean operations (`BoolOp` clauses for `and`/`or`). Traversal is scoped strictly per function definition to avoid inflating parent function complexity with nested callable definitions.
 
 ### E. Static vs. Dynamic Program Analysis
 AST Studio operates strictly within the domain of **Static Program Analysis**. Submitted code is treated as immutable data. Abstract interpretation, pattern recognition, and type constraint inference take place without instantiating Python virtual machine bytecodes or invoking `eval()`/`exec()`.
@@ -108,29 +108,29 @@ To ensure complete scientific transparency and academic honesty, the boundary be
 
 | Capability | Static Engine (`AI_PROVIDER=ast`) | AI Model-Backed Mode | Grounding & Validation Guardrail |
 | :--- | :--- | :--- | :--- |
-| **AST Parsing & Metrics** | `ast.parse`, `symtable`, McCabe $v(G)$, Halstead volume | Identical (always uses deterministic AST) | Compiler-level syntax checking (`compile()`) |
+| **AST Parsing & Metrics** | `ast.parse`, `symtable`, AST-derived CC, tokenized Halstead volume | Identical (always uses deterministic AST) | Compiler-level syntax checking (`compile()`) |
 | **Missing Docstring Detection** | Exact AST node inspection (`ast.get_docstring`) | Identical (detected via AST) | Bounded by function/class definition nodes |
 | **Docstring Generation** | Deterministic template grounded in AST parameter list & return type | LLM synthesizes natural English description | Rejects docstrings mentioning nonexistent parameters; validates code via `validator.py` |
 | **Security Scanning** | Static AST node visitor & entropy-based secret scanning | LLM reasoning informed by detected AST findings | Invariant check: cannot delete unrelated code |
 | **Patch Generation (REMEDY)** | Deterministic AST rewrite rules (e.g., `os.system` $\to$ `subprocess.run`) | LLM surgical patch suggestion | Mandatory human approval gate; unified diff review |
 | **Verification (VERITY)** | Deterministic AST parse & interface preservation check | Deterministic AST parse & interface preservation check | Automated verification gate; never bypassed |
 | **Project Dependencies** | Static import graph extraction (`ast.Import`, `ast.ImportFrom`) | Identical (always uses AST import graph) | Detects circular imports statically |
-| **Behavioral Tests** | Sandboxed pytest execution in temp directory (opt-in) | Sandboxed pytest execution in temp directory (opt-in) | `ALLOW_PROJECT_TEST_EXECUTION=false` by default |
+| **Behavioral Tests** | Restricted disposable subprocess execution (opt-in) | Restricted disposable subprocess execution (opt-in) | `ALLOW_PROJECT_TEST_EXECUTION=false` by default |
 
 ---
 
 ## 5. Measured Performance Benchmarks
 
-Rather than relying on unverified claims, all latency measurements are empirically benchmarked using `scripts/benchmark.py` across typical Python modules (averaged over 100 iterations on standard hardware):
+All latency measurements are empirically benchmarked using `scripts/benchmark.py` across three representative Python samples (5-line function, 16-line multi-branch module, and 24-line class, measured over 50 iterations each in deterministic `AI_PROVIDER=ast` mode):
 
 | Stage | Benchmark Script Component | Measured Mean Latency | Throughput |
 | :--- | :--- | :--- | :--- |
-| **AST Parsing & Metrics** | Lexing, parsing, symbol table, cyclomatic complexity | **~1.19 ms** | ~840 files/sec |
-| **Security AST Pattern Scan** | CWE-89, CWE-78, CWE-798, CWE-502, CWE-327, secrets | **~3.94 ms** | ~250 files/sec |
-| **Docstring & Fact Extraction** | Parameter annotations, docstring extraction, comment gen | **~0.40 ms** | ~2,500 files/sec |
-| **Full Static Pipeline** | Complete parse, metrics, security audit, and comment gen | **~6.38 ms** | **~155 files/sec** |
+| **AST Parsing & Metrics** | Lexing, parsing, symbol table, AST decision complexity | **~2.2 ms – 8.0 ms** | ~125–450 files/sec |
+| **Security AST Pattern Scan** | CWE-89, CWE-78, CWE-798, CWE-502, CWE-327, secrets | **~5.9 ms – 25.4 ms** | ~40–170 files/sec |
+| **Docstring & Fact Extraction** | Parameter annotations, docstring extraction, comment gen | **~0.6 ms – 4.7 ms** | ~215–1,700 files/sec |
+| **Full Static Pipeline** | Complete parse, metrics, security audit, and comment gen | **~9.6 ms – 38.3 ms** | **~26–105 files/sec** |
 
-*To reproduce these measurements on your machine: `python scripts/benchmark.py`.*
+*Note: Latency varies based on module size, AST depth, and host environment. To reproduce on your machine: `python scripts/benchmark.py`.*
 
 ---
 
@@ -142,11 +142,11 @@ When running in **AI Model Mode**, AST Studio connects to model backends using s
 | :--- | :--- | :--- | :--- | :--- |
 | `ast` *(default)* | Deterministic AST Compiler | **Local (Offline)** | None | Zero API key needed; 100% deterministic & hermetic |
 | `openai` | OpenAI API | Cloud | `gpt-4o-mini` | Standard ChatCompletions endpoint |
-| `gemini` | Google Gemini API | Cloud | `gemini-1.5-flash` | High context window & fast analysis |
+| `gemini` | Google Gemini API | Cloud | `gemini-2.0-flash` | High context window & fast analysis |
 | `groq` | Groq Cloud LPU | Cloud | `llama-3.3-70b-versatile` | Ultra-low-latency cloud inference |
-| `anthropic` | Anthropic Claude | Cloud | `claude-3-5-sonnet-latest` | Strict JSON schema adherence |
-| `ollama` | Ollama Server | **Local (Offline)** | `deepseek-coder` | Completely local LLM execution at `http://localhost:11434` |
-| `huggingface` | Hugging Face Router | Cloud | `meta-llama/Llama-3.2-3B-Instruct` | Automatic provider parameter normalization |
+| `anthropic` | Anthropic Claude | Cloud | `claude-3-5-sonnet-20241022` | Strict JSON schema adherence |
+| `ollama` | Ollama Server | **Local (Offline)** | `qwen2.5-coder:7b` | Completely local LLM execution at `http://localhost:11434` |
+| `huggingface` | Hugging Face Router | Cloud | `Qwen/Qwen3.5-35B-A3B` | Automatic provider parameter normalization |
 | `copilot` | GitHub Copilot | Cloud | `gpt-4o` | Verified enterprise token gateway |
 
 ---
@@ -163,7 +163,7 @@ The **NEXUS Multi-Agent Workforce** operates across six specialist agents: **ATL
 | `find_symbol(symbol_name)` | AST-grounded definition and reference locator across the entire project. | `{symbol, definitions: [...], references: [...]}` |
 | `get_import_graph()` | Analyzes imports across all project modules; computes dependency adjacency and flags cycles. | `{modules: [...], edges: [...], circular_imports: [...]}` |
 | `propose_file_patch(path, patch_content, ...)` | Non-destructive staging of file modifications; creates atomic snapshots for rollback. | `{snapshot_id, path, diff, status: "staged"}` |
-| `run_isolated_behavioral_tests(test_target)` | Opt-in sandboxed pytest execution in a temporary workspace clone. | `{executed: bool, exit_code, stdout, stderr}` |
+| `run_isolated_behavioral_tests(test_target)` | Opt-in pytest execution in a restricted temporary workspace clone. | `{executed: bool, exit_code, stdout, stderr}` |
 
 ---
 
@@ -172,11 +172,11 @@ The **NEXUS Multi-Agent Workforce** operates across six specialist agents: **ATL
 AST Studio treats execution safety and static isolation as foundational requirements:
 
 1. **Static Analysis Guarantee:** User-submitted Python code is treated as immutable data. The engine inspects AST syntax nodes and never invokes `eval()`, `exec()`, or dynamic runtime reflection.
-2. **Execution Boundary for Project Tests:** The Project Workbench includes an isolated test runner. However, to prevent arbitrary code execution from untrusted project archives, dynamic test execution is strictly disabled by default:
+2. **Execution Boundary for Project Tests:** The Project Workbench includes an optional test runner. However, to prevent arbitrary code execution from untrusted project archives, dynamic test execution is strictly disabled by default:
    ```bash
    ALLOW_PROJECT_TEST_EXECUTION=false   # Default: Safe mode (Tests NOT run)
    ```
-   When set to `true`, tests execute exclusively inside an isolated temporary directory with network environment variables stripped (`http_proxy`, `https_proxy`, `all_proxy` blocked), a hard 30-second timeout, OS resource limits, and capped stdout/stderr buffers.
+   When set to `true`, tests execute within a restricted disposable subprocess with network environment variables stripped (`http_proxy`, `https_proxy`, `all_proxy` blackholed), a hard 30-second timeout, OS resource limits where supported, and capped stdout/stderr buffers. Note that this runner is a restricted subprocess environment, not a full OS-level container/jail (e.g., Docker or Linux namespaces); execution of untrusted uploaded project suites should only occur within an isolated container boundary.
 3. **SSRF & Network Isolation:** In automated test and analysis environments, all outbound socket DNS queries are hermetically intercepted or validated against private IP ranges (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `169.254.169.254`).
 4. **Session Token Isolation:** Workflows and SSE streams require an ephemeral 256-bit cryptographically secure session token (`X-Session-Token`).
 
@@ -196,18 +196,18 @@ In the interest of rigorous academic evaluation, the following architectural bou
 ## 10. Technology Stack & Compatibility
 
 - **Supported Python Versions:** **Python 3.12** and **Python 3.13** (Continuously tested in GitHub Actions CI matrix; compatible with Python 3.10+)
-- **Backend:** Flask 3.1.0, Werkzeug 3.1.3
+- **Backend:** Flask 3.1.3, Werkzeug 3.1.6
 - **Grammar & Lexer:** Python standard library `ast`, `symtable`, `tokenize`
 - **Persistence:** SQLite 3 (embedded, zero-configuration)
 - **Frontend:** Semantic HTML5, CSS3 Custom Properties (Design Tokens), Vanilla ES6 JavaScript (zero npm build step)
-- **Testing & Quality:** Pytest, Pytest-Cov, Playwright (Chromium E2E headless), Ruff
+- **Testing & Quality:** Pytest, Pytest-Cov, Playwright (Chromium E2E headless; install via `python -m playwright install --with-deps chromium`, run via `pytest --run-browser-tests`), Ruff
 
 ---
 
 ## 11. Academic Evaluation & Demonstration Scripts
 
-- **Evaluation Benchmark:** See [docs/EVALUATION.md](file:///c:/Users/radha/Desktop/TheoryOfAutomata/Intelligent_CodeCommentGenerationViaAST/Intelligent_CodeCommentGenerationViaAST/docs/EVALUATION.md) for automated evaluation results across the curated benchmark suite (`sample example/`). Re-run anytime with `python scripts/evaluate_samples.py`.
-- **Live Interactive Demo Script:** See [docs/DEMO.md](file:///c:/Users/radha/Desktop/TheoryOfAutomata/Intelligent_CodeCommentGenerationViaAST/Intelligent_CodeCommentGenerationViaAST/docs/DEMO.md) for a click-by-click demonstration script covering multi-file workspace upload, NEXUS auditing, side-by-side diff review, approval, and snapshot rollback.
+- **Evaluation Benchmark:** See [docs/EVALUATION.md](docs/EVALUATION.md) for automated evaluation results across the curated benchmark suite (`sample example/`). Re-run anytime with `python scripts/evaluate_samples.py`.
+- **Live Interactive Demo Script:** See [docs/DEMO.md](docs/DEMO.md) for a click-by-click demonstration script covering multi-file workspace upload, NEXUS auditing, side-by-side diff review, approval, and snapshot rollback.
 - **Academic Packaging:** Generate a pristine, sanitized submission package containing strictly `git ls-files` with zero credentials, virtual environments, or temporary artifacts:
   ```powershell
   python scripts/build_clean_submission.py
@@ -217,5 +217,5 @@ In the interest of rigorous academic evaluation, the following architectural bou
 
 ## 12. License & Academic Authorship
 
-Distributed under the **Apache-2.0 License**. See [LICENSE](file:///c:/Users/radha/Desktop/TheoryOfAutomata/Intelligent_CodeCommentGenerationViaAST/Intelligent_CodeCommentGenerationViaAST/LICENSE) for complete details.
+Distributed under the **Apache-2.0 License**. See [LICENSE](LICENSE) for complete details.
 Developed for academic evaluation, research, and compiler engineering coursework in Theory of Automata and Software Verification.

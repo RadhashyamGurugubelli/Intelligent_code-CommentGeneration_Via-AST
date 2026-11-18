@@ -1,15 +1,15 @@
-"""Disposable Isolated Sandbox for Behavioral Code Verification.
+"""Restricted Subprocess Environment for Behavioral Code Verification.
 
-Provides secure, sandboxed execution of test harnesses against candidate code:
-- Disposable temporary directory environment
-- Non-root / unprivileged subprocess execution
-- No host filesystem access outside the disposable sandbox directory
+Provides restricted subprocess execution of test harnesses against candidate code:
+- Disposable temporary directory working directory
+- Subprocess launched in isolated mode (`python -I`)
 - Complete scrub of application secrets, provider credentials, and tokens from environment
-- Network disabled by default via proxy disabling and socket connect interception
-- Strict CPU / execution timeouts (preventing infinite loops)
+- Network disabled by default via proxy blackholing and socket interception
+- Strict execution timeouts (preventing infinite loops)
 - Output size limits (preventing memory exhaustion)
 - Retains text-only mode when behavioral testing is disabled or unavailable
-- NEVER executes arbitrary code inside the main Flask process
+- NEVER executes arbitrary candidate code inside the main Flask process
+- NOTE: This provides a restricted subprocess execution environment, not a full OS-level container/jail (such as Docker or Linux namespaces).
 """
 
 from __future__ import annotations

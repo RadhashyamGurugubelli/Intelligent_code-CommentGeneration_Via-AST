@@ -14,6 +14,7 @@ Verifies:
 
 import ast
 import io
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -199,6 +200,65 @@ def main_caller():
         self.assertIn("maintainability_index", metrics)
         self.assertIn("documentation_coverage", metrics)
         self.assertIn("overall_percentage", metrics["documentation_coverage"])
+
+    def test_nested_function_complexity_isolation(self):
+        # Nested functions should not inflate outer function complexity
+        code = """def outer(x):
+    if x > 0:
+        def inner(y):
+            if y == 1:
+                return 10
+            elif y == 2:
+                return 20
+            return 0
+        return inner(x)
+    return -1
+"""
+        ws = ProjectWorkspace(base_storage_dir=Path(self.tmp_dir.name))
+        ws.load_files_dict({"nested.py": code})
+        intel = ProjectCodeIntelligence(ws)
+        metrics = intel.calculate_project_metrics()
+        # outer has: 1 base + 1 (if x > 0) = 2
+        # inner has: 1 base + 2 (if y==1, elif y==2) = 3
+        # Max complexity should be 3, not 5 (2 + 3)
+        self.assertEqual(metrics["maximum_cyclomatic_complexity"], 3)
+
+    def test_boolean_and_match_complexity(self):
+        code = """def evaluate_conditions(a, b, c, mode):
+    if a and b or c:
+        match mode:
+            case 1 if a:
+                return "one_guarded"
+            case 2:
+                return "two"
+            case _:
+                return "other"
+    return "none"
+"""
+        ws = ProjectWorkspace(base_storage_dir=Path(self.tmp_dir.name))
+        ws.load_files_dict({"cond.py": code})
+        intel = ProjectCodeIntelligence(ws)
+        metrics = intel.calculate_project_metrics()
+        # 1 (base) + 1 (if) + 2 (BoolOp: 3 values - 1) + 3 (match cases: 1, 2, _) + 1 (guard) = 8
+        self.assertGreaterEqual(metrics["maximum_cyclomatic_complexity"], 7)
+
+    def test_halstead_volume_varies_with_tokens(self):
+        from backend.project.code_intelligence import _compute_halstead_volume
+        short_code = "x = 1\n"
+        complex_code = """
+import math
+def compute(values, scale=1.0):
+    result = []
+    for val in values:
+        if val > 0:
+            result.append(math.sqrt(val) * scale)
+        else:
+            result.append(0.0)
+    return sum(result)
+"""
+        hv_short = _compute_halstead_volume(short_code)
+        hv_complex = _compute_halstead_volume(complex_code)
+        self.assertGreater(hv_complex, hv_short)
 
 
 class DocumentationGeneratorTests(unittest.TestCase):
@@ -485,6 +545,46 @@ class ProjectChangeManagementAndAPITests(unittest.TestCase):
         export_resp = self.client.get(f"/api/project/{ws_id}/export")
         self.assertEqual(export_resp.status_code, 200)
         self.assertEqual(export_resp.mimetype, "application/zip")
+
+    def test_api_project_upload_large_archive_above_1mb_succeeds(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("app.py", "def run():\n    return 'ok'\n")
+            # Write incompressible payload over 1 MB (so compressed archive is > 1MB)
+            zf.writestr("large_data.bin", b"X" * 1024 + os.urandom(1_200_000))
+        archive_data = buf.getvalue()
+        self.assertGreater(len(archive_data), 1024 * 1024)
+
+        resp = self.client.post(
+            "/api/project/upload",
+            data={"archive": (io.BytesIO(archive_data), "project.zip")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(resp.status_code, 201)
+        ws_id = resp.get_json()["workspace_id"]
+        from backend.project.routes import _ACTIVE_WORKSPACES
+        ws = _ACTIVE_WORKSPACES.pop(ws_id, None)
+        if ws:
+            ws.cleanup()
+
+    def test_api_project_upload_exceeding_max_archive_rejected(self):
+        oversized = b"PK\x05\x06" + b"\x00" * 18 + b"0" * (26 * 1024 * 1024)
+        resp = self.client.post(
+            "/api/project/upload",
+            data={"archive": (io.BytesIO(oversized), "huge.zip")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("error", resp.get_json())
+
+    def test_api_project_upload_exceeding_flask_max_content_length_rejected_with_413(self):
+        huge_payload = b"PK\x05\x06" + b"\x00" * 18 + b"0" * (31 * 1024 * 1024)
+        resp = self.client.post(
+            "/api/project/upload",
+            data={"archive": (io.BytesIO(huge_payload), "massive.zip")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(resp.status_code, 413)
 
 
 if __name__ == "__main__":

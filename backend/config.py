@@ -69,7 +69,7 @@ class AppConfig:
     # Separate application server access key from provider credentials
     SERVER_API_KEY = os.getenv("SERVER_API_KEY", os.getenv("API_KEY", "")).strip()
     API_KEY = SERVER_API_KEY
-    AI_PROVIDER = os.getenv("AI_PROVIDER", "huggingface").strip().lower()
+    AI_PROVIDER = os.getenv("AI_PROVIDER", "ast").strip().lower()
     API_KEY_PROVIDER = AI_PROVIDER
     DOCSTRING_STYLE = os.getenv("DOCSTRING_STYLE", "google").strip().lower()
 
@@ -127,7 +127,7 @@ class AppConfig:
         if IS_PRODUCTION and "REQUIRE_API_KEY" not in os.environ
         else _as_bool(os.getenv("REQUIRE_API_KEY", "false"))
     )
-    MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", str(1024 * 1024)))
+    MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", str(30 * 1024 * 1024)))
     MAX_SOURCE_LENGTH = 50_000
     AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "1500"))
     AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "6"))

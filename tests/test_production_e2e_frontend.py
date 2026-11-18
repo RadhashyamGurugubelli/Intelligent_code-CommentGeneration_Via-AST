@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import threading
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,7 +29,7 @@ from werkzeug.serving import make_server
 
 from backend.app import create_app
 
-CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+CHROME_PATH = os.getenv("PLAYWRIGHT_CHROME_PATH") or os.getenv("PLAYWRIGHT_EXECUTABLE_PATH")
 
 SAMPLE_CODE = """
 def divide_elements(a, b):
@@ -56,12 +57,14 @@ def live_server():
 @pytest.fixture(scope="module")
 def browser_context():
     """Launch headless Chrome using Playwright."""
+    launch_kwargs = {
+        "headless": True,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+    }
+    if CHROME_PATH:
+        launch_kwargs["executable_path"] = CHROME_PATH
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            executable_path=CHROME_PATH,
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(viewport={"width": 1280, "height": 900})
         yield context
         browser.close()

@@ -119,7 +119,7 @@ def generate_evaluation_markdown(results: list[dict[str, any]]) -> str:
         f"- **Validation Success Rate**: {passed_count}/{len(results)} (100% of valid files pass AST compile validation; invalid files correctly caught)",
         f"- **Total Security & Quality Findings Flagged**: {total_findings}",
         f"- **Total Documented Function/Class Blocks**: {total_docstrings}",
-        f"- **Execution Paradigm**: Deterministic AST standard-library analysis (Air-gapped)",
+        "- **Execution Paradigm**: Deterministic AST standard-library analysis (Air-gapped)",
         "",
         "## Observations",
         "1. **Syntax Errors (`sample8_syntax_error.py`)**: Safely rejected at the parser boundary without executing invalid bytecodes.",

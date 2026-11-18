@@ -109,19 +109,22 @@ class EngineeringToolsRunner:
             }
 
     def run_pytest(self, args: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Run pytest in an isolated disposable sandbox when ALLOW_PROJECT_TEST_EXECUTION=true.
+        """Run pytest in a restricted disposable subprocess when ALLOW_PROJECT_TEST_EXECUTION=true.
 
         When ALLOW_PROJECT_TEST_EXECUTION is false (the default):
         Reports pytest as NOT RUN with a clear explanatory notice to prevent arbitrary
-        uploaded project code execution.
+        uploaded project code execution without an OS-level sandbox.
 
         When ALLOW_PROJECT_TEST_EXECUTION is true (opt-in):
-        Executes pytest in a subprocess with:
+        Executes pytest in a restricted subprocess with:
         - a temporary disposable directory copy of the workspace
         - scrubbed environment variables with network disabled (proxy blackholes)
         - hard timeout of 30 seconds
         - CPU and memory resource limits via the `resource` module where available
         - output size cap (64KB)
+
+        Note: This is a restricted subprocess runner, not a full OS-level container/jail
+        (e.g., Docker/cgroups). Arbitrary untrusted code requires an external container boundary.
         """
         allow_exec = os.getenv("ALLOW_PROJECT_TEST_EXECUTION", "false").lower() in ("true", "1", "yes")
         cmd = [sys.executable, "-m", "pytest"] + (args or ["-q"])

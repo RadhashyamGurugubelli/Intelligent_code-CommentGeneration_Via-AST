@@ -2,7 +2,6 @@
 
 import multiprocessing
 import os
-import sys
 
 # Bind address and port
 bind = os.getenv("BIND_ADDRESS", f"0.0.0.0:{os.getenv('PORT', '5000')}")

@@ -7,7 +7,6 @@ Produces dist/AST_Studio_Submission.zip ready for evaluation.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import zipfile

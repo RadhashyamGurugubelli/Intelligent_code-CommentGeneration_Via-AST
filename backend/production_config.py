@@ -55,7 +55,7 @@ class ProductionConfig(AppConfig):
     }
 
     # Bounded resource limits
-    MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", str(5 * 1024 * 1024)))  # 5MB
+    MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", str(30 * 1024 * 1024)))  # 30MB (allows 25MB archive + multipart overhead)
     MAX_SOURCE_LENGTH = int(os.getenv("MAX_SOURCE_LENGTH", "100000"))
     MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "50"))
     MAX_EXECUTION_WALL_CLOCK_SECONDS = int(os.getenv("MAX_EXECUTION_WALL_CLOCK_SECONDS", "300"))

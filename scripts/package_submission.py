@@ -218,7 +218,7 @@ def create_clean_submission_package(output_zip: Path | None = None) -> Path:
     zip_size_mb = output_zip.stat().st_size / (1024 * 1024)
     print(" [PASSED] Archive verification successful.")
     print("=" * 60)
-    print(f"SUCCESS: Created Academic Submission Archive:")
+    print("SUCCESS: Created Academic Submission Archive:")
     print(f"Location: {output_zip}")
     print(f"Archive Size: {zip_size_mb:.2f} MB")
     print(f"Files bundled: {len(namelist)}")

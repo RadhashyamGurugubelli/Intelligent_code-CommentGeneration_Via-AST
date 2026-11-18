@@ -6067,7 +6067,6 @@ function initNexusConversationalWorkspace() {
                 taskInput.style.height = 'auto';
                 taskInput.style.height = Math.min(taskInput.scrollHeight, 180) + 'px';
             }
-            runAgenticSwarm(task, intent);
             previewNexusPlan(task, intent);
         });
     });
