@@ -134,8 +134,7 @@ if __name__ == "__main__":
     records = evaluate_samples()
     markdown_content = generate_evaluation_markdown(records)
 
-    eval_path = ROOT_DIR / "docs" / "EVALUATION.md"
-    eval_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_path = ROOT_DIR / "EVALUATION.md"
     with open(eval_path, "w", encoding="utf-8") as f:
         f.write(markdown_content)
 

@@ -583,7 +583,7 @@ class TestFrontendE2E:
                     workspace.cleanup()
             page.close()
 
-    def test_offline_mode_and_zero_remote_traffic(self, live_server: str, browser_context):
+    def test_offline_mode_and_zero_remote_traffic(self, live_server: str, browser_context, tmp_path):
         """Verify the app functions completely offline with all remote traffic blocked."""
         import os
         from pathlib import Path
@@ -630,7 +630,7 @@ class TestFrontendE2E:
             assert "def calculate_tax" in output_text
 
             # 6. Capture offline mode screenshot for audit proof
-            screenshots_dir = Path("docs/screenshots")
+            screenshots_dir = tmp_path / "screenshots"
             screenshots_dir.mkdir(parents=True, exist_ok=True)
             screenshot_path = str(screenshots_dir / "offline_mode_verified.png")
             page.screenshot(path=screenshot_path)
