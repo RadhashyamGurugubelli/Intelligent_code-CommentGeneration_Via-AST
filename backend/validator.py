@@ -256,23 +256,61 @@ def _strip_docstrings(node):
 
 
 def _scope_docstrings(tree):
-    scopes = (
-        ast.Module,
-        ast.FunctionDef,
-        ast.AsyncFunctionDef,
-        ast.ClassDef,
+    class DocstringScopeVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.result = {}
+            self.scope_path = []
+
+        def _visit_scope(self, node, name):
+            self.scope_path.append(name)
+            scope_key = (type(node).__name__, ".".join(self.scope_path))
+            self.result[scope_key] = ast.get_docstring(node, clean=False)
+            self.generic_visit(node)
+            self.scope_path.pop()
+
+        def visit_Module(self, node):
+            self.result[("Module", "<module>")] = ast.get_docstring(
+                node, clean=False
+            )
+            self.generic_visit(node)
+
+        def visit_ClassDef(self, node):
+            self._visit_scope(node, node.name)
+
+        def visit_FunctionDef(self, node):
+            self._visit_scope(node, node.name)
+
+        def visit_AsyncFunctionDef(self, node):
+            self._visit_scope(node, node.name)
+
+    visitor = DocstringScopeVisitor()
+    visitor.visit(tree)
+    return visitor.result
+
+
+def _docstring_is_short_enrichment(original_docstring, generated_docstring):
+    if not original_docstring or not generated_docstring:
+        return False
+    if "\n" in original_docstring.strip() or len(original_docstring.strip()) > 120:
+        return False
+    if not generated_docstring.startswith(original_docstring):
+        return False
+    added_text = generated_docstring[len(original_docstring) :].strip()
+    section_markers = (
+        "Args:",
+        "Returns:",
+        "Raises:",
+        "Security Note:",
+        ":param ",
+        ":returns:",
+        ":raises ",
+        "Parameters\n",
+        "Returns\n",
+        "Raises\n",
     )
-    result = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, scopes):
-            continue
-        scope_key = (
-            type(node).__name__,
-            getattr(node, "name", None),
-            getattr(node, "lineno", None),
-        )
-        result[scope_key] = ast.get_docstring(node, clean=False)
-    return result
+    return bool(added_text) and any(
+        marker in added_text for marker in section_markers
+    )
 
 
 def _comment_tokens(source_code):
@@ -325,7 +363,9 @@ def _normalize_ast(tree):
     return ast.dump(_strip_docstrings(tree), include_attributes=False)
 
 
-def validate_generated_code(original_code, generated_code):
+def validate_generated_code(
+    original_code, generated_code, allow_docstring_enrichment=False
+):
     """Validate that generation preserves executable logic."""
     issues = []
     try:
@@ -349,6 +389,12 @@ def validate_generated_code(original_code, generated_code):
             if (
                 original_docstring is not None
                 and generated_docstring != original_docstring
+                and not (
+                    allow_docstring_enrichment
+                    and _docstring_is_short_enrichment(
+                        original_docstring, generated_docstring
+                    )
+                )
             ):
                 issues.append(
                     f"An existing docstring changed or was removed in {scope_key[1] or scope_key[0]}."

@@ -62,6 +62,30 @@ _TEXT_ATTACKS = (
             re.IGNORECASE,
         ),
     ),
+    (
+        "indirect_prompt_injection",
+        "critical",
+        re.compile(
+            r"(?i)\b(?:AI\s*instruction|system\s*prompt|system\s*message|developer\s*instruction|hidden\s*command)\b.{0,80}"
+            r"\b(?:ignore|override|execute|exfiltrate|delete|bypass|secret)\b",
+        ),
+    ),
+    (
+        "unauthorized_tool_manipulation",
+        "high",
+        re.compile(
+            r"(?i)\b(?:call\s+tool|invoke\s+tool|execute\s+tool|force\s+tool|run\s+tool)\b.{0,60}"
+            r"\b(?:unapproved|without\s+approval|bypass\s+approval|bash|shell|terminal|exec|rm\s+-rf)\b",
+        ),
+    ),
+    (
+        "memory_poisoning",
+        "high",
+        re.compile(
+            r"(?i)\b(?:overwrite|poison|corrupt|modify|fake|inject)\b.{0,60}"
+            r"\b(?:history|memory|conversation|trajectory|context|session\s+state)\b",
+        ),
+    ),
 )
 
 _SEVERITY_SCORE = {"low": 30, "medium": 60, "high": 85, "critical": 100}
@@ -81,6 +105,9 @@ _REASON = {
     "redos_risk": "Catastrophic backtracking regular expression pattern detected.",
     "ssrf_risk": "Unvalidated dynamic URL destination in outbound HTTP network request.",
     "exposed_debug_mode": "Exposed debug or development mode in application code.",
+    "indirect_prompt_injection": "Attempts to inject instructions indirectly via comments or documentation.",
+    "unauthorized_tool_manipulation": "Attempts to manipulate or force unauthorized tool execution.",
+    "memory_poisoning": "Attempts to poison conversation history or agent memory state.",
 }
 
 

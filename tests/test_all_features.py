@@ -19,24 +19,20 @@ from backend.agent import (
     _verification,
 )
 from backend.attack_guard import detect_attack, evaluate_attack_suite
+from backend.agentic.runtime import AgentRuntime
+from backend.agentic.session import SessionManager
+from backend.ast_analyzer import analyze_code as analyze_ast_code
 from backend.code_analysis import analyze_code, validate_generated_code
-from backend.code_improver import _definition_names, _warnings_for
 from backend.multi_agent_orchestrator import run_multi_agent_workflow
 from backend.optimization_agent import (
     _estimate_complexity,
-    _transform_deterministic_ast,
     detect_optimization_opportunities,
     optimize_code,
 )
 from backend.pipeline import run_pipeline
-from backend.rules import apply_rules, build_review_score, summarize_quality
+from backend.rules import build_review_score, summarize_quality
 from backend.security_attack_agent import (
-    _find_command_injections,
-    _find_deserializations,
-    _find_dynamic_sql,
-    _find_hardcoded_secrets,
     _find_path_traversals,
-    _find_ssl_verification_disabled,
     simulate_attacks,
 )
 from backend.security_fixing_agent import (
@@ -59,6 +55,29 @@ from backend.multi_agents import (
 from backend.prompt_builder import build_ai_messages, build_prompt_payload
 from backend.type_analyzer import find_definite_type_errors
 from backend.validator import has_added_comments, validate_code
+
+
+def _run_agentic_workflow_without_provider(source_code, task, auto_approve=False):
+    if auto_approve:
+        raise AssertionError("Tests must review candidates before approving them.")
+    runtime = AgentRuntime(
+        session_manager=SessionManager(),
+        model_client=None,
+    )
+    session = runtime.start_session(source_code, task)
+    result = runtime.execute_session(session.session_id)
+    while result["status"] == "awaiting_approval":
+        pending = session.pending_approval
+        if not pending or not pending.get("diff"):
+            raise AssertionError("A candidate must be reviewed before approval.")
+        runtime.handle_user_action(
+            session.session_id,
+            "approve",
+            "Test reviewed the staged candidate diff.",
+            candidate_digest=pending["candidate_digest"],
+        )
+        result = runtime.execute_session(session.session_id)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -176,6 +195,135 @@ class SecurityAttackSimulationTests(unittest.TestCase):
         self.assertTrue(sim["is_vulnerable"])
         self.assertTrue(any("CWE-89" in s["cwe"] for s in sim["attack_scenarios"]))
         self.assertLess(sim["resilience_score"], 100)
+
+    def test_flask_request_data_in_dynamic_template_is_reported_with_flow_evidence(self):
+        source = """from flask import Flask, request, render_template_string
+
+app = Flask(__name__)
+
+@app.route('/greet')
+def greet():
+    name = request.args.get('name', 'Guest')
+    template = f"<h1>Hello, {name}!</h1>"
+    return render_template_string(template)
+"""
+        analysis = analyze_ast_code(source)
+        simulation = simulate_attacks(source)
+        warning = next(
+            item for item in analysis["warnings"] if item["rule_id"] == "SEC007"
+        )
+        finding = next(
+            item
+            for item in simulation["attack_scenarios"]
+            if item["id"].startswith("SIM-TPL-")
+        )
+
+        self.assertIn("XSS", warning["message"])
+        self.assertEqual(warning["line"], 9)
+        self.assertEqual(finding["source_line"], 7)
+        self.assertEqual(finding["template_line"], 8)
+        self.assertEqual(finding["sink_line"], 9)
+        self.assertIn("render_template_string", finding["sink"])
+        self.assertIn("XSS", finding["impact"])
+        self.assertIn("render_template('greet.html'", finding["mitigation"])
+        self.assertEqual(finding["confidence"], "high")
+        self.assertTrue(simulation["is_vulnerable"])
+        self.assertLess(simulation["resilience_score"], 100)
+
+    def test_dynamic_template_flow_resolves_import_aliases_without_flagging_safe_templates(self):
+        unsafe = """from flask import render_template_string as render, request as req
+
+def greet():
+    name = req.args.get("name", "Guest")
+    template = f"<h1>{name}</h1>"
+    return render(template)
+"""
+        safe = """from flask import render_template, request
+
+def greet():
+    name = request.args.get("name", "Guest")
+    return render_template("greet.html", name=name)
+"""
+        unsafe_analysis = analyze_ast_code(unsafe)
+        unsafe_simulation = simulate_attacks(unsafe)
+        safe_analysis = analyze_ast_code(safe)
+        safe_simulation = simulate_attacks(safe)
+
+        self.assertIn(
+            "SEC007", {item["rule_id"] for item in unsafe_analysis["warnings"]}
+        )
+        self.assertTrue(
+            any(item["id"].startswith("SIM-TPL-") for item in unsafe_simulation["attack_scenarios"])
+        )
+        self.assertNotIn(
+            "SEC007", {item["rule_id"] for item in safe_analysis["warnings"]}
+        )
+        self.assertFalse(
+            any(item["id"].startswith("SIM-TPL-") for item in safe_simulation["attack_scenarios"])
+        )
+
+    def test_sql_parameter_flow_reaches_execute_with_origin_uncertainty(self):
+        source = """import sqlite3
+
+def get_user_records(user_id):
+    conn = sqlite3.connect('production.db')
+    cursor = conn.cursor()
+    query = f"SELECT id, username, email, role FROM users WHERE id = {user_id}"
+    cursor.execute(query)
+    return cursor.fetchall()
+"""
+        analysis = analyze_ast_code(source)
+        simulation = simulate_attacks(source)
+        warning = next(
+            item for item in analysis["warnings"] if item["rule_id"] == "SEC002"
+        )
+        finding = next(
+            item
+            for item in simulation["attack_scenarios"]
+            if "CWE-89" in item["cwe"]
+        )
+
+        self.assertEqual(warning["line"], 7)
+        self.assertEqual(finding["target_line"], 6)
+        self.assertEqual(finding["source_line"], 3)
+        self.assertEqual(finding["sink_line"], 7)
+        self.assertIn("user_id", finding["source"])
+        self.assertIn("external origin is not shown", finding["source"])
+        self.assertEqual(finding["confidence"], "medium")
+        self.assertLess(simulation["resilience_score"], 100)
+        self.assertEqual(
+            simulation["vulnerabilities_detected"],
+            len(simulation["attack_scenarios"]),
+        )
+
+    def test_security_scan_endpoint_agrees_with_sql_warning_findings(self):
+        source = """import sqlite3
+
+def get_user_records(user_id):
+    conn = sqlite3.connect('production.db')
+    cursor = conn.cursor()
+    query = f"SELECT id, username, email, role FROM users WHERE id = {user_id}"
+    cursor.execute(query)
+    return cursor.fetchall()
+"""
+        with app_module.app.test_client() as client:
+            analyze_response = client.post("/analyze", json={"code": source})
+            scan_response = client.post(
+                "/agent/simulate-attacks", json={"code": source}
+            )
+
+        analysis_payload = analyze_response.get_json()
+        scan_payload = scan_response.get_json()
+        self.assertEqual(analyze_response.status_code, 200)
+        self.assertEqual(scan_response.status_code, 200)
+        self.assertIn(
+            "SEC002",
+            {item["rule_id"] for item in analysis_payload["warnings"]},
+        )
+        self.assertEqual(scan_payload["vulnerabilities_detected"], 1)
+        self.assertTrue(scan_payload["is_vulnerable"])
+        self.assertLess(scan_payload["resilience_score"], 100)
+        self.assertEqual(scan_payload["total_checks_run"], 14)
 
     def test_command_injection_via_os_system(self):
         code = "import os\ndef run(cmd):\n    return os.system(cmd)\n"
@@ -828,6 +976,14 @@ class HTTPEndpointTests(unittest.TestCase):
     def setUp(self):
         self.client = app_module.app.test_client()
 
+    def _post_collaborative_workflow(self, payload):
+        with patch.object(app_module, "agentic_model_ready", return_value=True), patch.object(
+            app_module,
+            "run_agentic_workflow_sync",
+            side_effect=_run_agentic_workflow_without_provider,
+        ):
+            return self.client.post("/agent/multi-agent-workflow", json=payload)
+
     # --- /health ---
     def test_health_endpoint(self):
         resp = self.client.get("/health")
@@ -918,11 +1074,67 @@ class HTTPEndpointTests(unittest.TestCase):
     # --- /agent/multi-agent-workflow ---
     def test_agent_multi_agent_workflow_endpoint(self):
         code = "def parse(expr):\n    return eval(expr)\n"
-        resp = self.client.post("/agent/multi-agent-workflow", json={"code": code})
+        resp = self._post_collaborative_workflow({"code": code})
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
         self.assertEqual(data["workflow"], "multi_agent_collaboration")
         self.assertEqual(len(data["timeline"]), 4)
+        self.assertEqual(data["summary"]["model_call_count"], 0)
+
+    def test_full_multi_agent_workflow_reports_undefined_names_without_crashing(self):
+        code = "def read_value():\n    return missing_dependency.fetch()\n"
+        response = self._post_collaborative_workflow({
+            "code": code,
+            "full_pipeline": True,
+            "include_docstrings": True,
+        })
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        architect_findings = response.get_json()["stages"][0]["findings"]
+        self.assertTrue(
+            any("missing_dependency" in json.dumps(item) for item in architect_findings)
+        )
+
+    def test_full_multi_agent_workflow_includes_validated_docs_when_full_pipeline_is_requested(self):
+        code = (
+            "class Calculator:\n"
+            "    def add(self, a, b):\n"
+            "        return a + b\n"
+        )
+        resp = self._post_collaborative_workflow({
+            "code": code,
+            "full_pipeline": True,
+            "include_docstrings": False,
+        })
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(len(data["stages"]), 6)
+        doc_agent = data["agents"]["docstring"]
+        self.assertEqual(doc_agent["status"], "completed")
+        self.assertEqual(doc_agent["execution_mode"], "deterministic")
+        self.assertIn('"""', data["final_hardened_code"])
+        self.assertIn("#", data["final_hardened_code"])
+        self.assertTrue(data["stages"][4]["code_modified"])
+
+    def test_multi_agent_workflow_includes_docs_when_docstrings_are_requested_alone(self):
+        code = (
+            "class Calculator:\n"
+            "    def add(self, a, b):\n"
+            "        return a + b\n"
+        )
+        resp = self._post_collaborative_workflow({
+            "code": code,
+            "full_pipeline": False,
+            "include_docstrings": True,
+        })
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertIn('"""', data["final_hardened_code"])
+        self.assertIn("# Defines class Calculator.", data["final_hardened_code"])
+        doc_stage = next(stage for stage in data["stages"] if stage["agent_id"] == "docstring")
+        self.assertTrue(doc_stage["code_modified"])
 
     def test_agent_multi_agent_workflow_syntax_error(self):
         resp = self.client.post(
@@ -1143,12 +1355,12 @@ class MultiAgentsModuleTests(unittest.TestCase):
     def test_code_optimization_agent_init(self):
         agent = CodeOptimizationAgent(model_client=None, model_name="gpt-4")
         self.assertEqual(agent.name, "CodeOptimizationAgent")
-        self.assertIn("Code Optimization Agent", agent.system_prompt)
+        self.assertIn("FORGE, the Code Engineering Agent", agent.system_prompt)
 
     def test_code_security_review_agent_init(self):
         agent = CodeSecurityReviewAgent(model_client=None, model_name="gpt-4")
         self.assertEqual(agent.name, "CodeSecurityReviewAgent")
-        self.assertIn("Code Security Review Agent", agent.system_prompt)
+        self.assertIn("REMEDY, the Code Remediation Agent", agent.system_prompt)
 
     def test_run_multi_agent_pipeline_success(self):
         mock_client = SimpleNamespace(

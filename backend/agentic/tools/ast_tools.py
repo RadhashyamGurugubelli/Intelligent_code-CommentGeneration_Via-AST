@@ -8,7 +8,6 @@ from backend.ast_analyzer import (
     analyze_code,
     build_smart_ast_explanations,
 )
-from backend.rules import apply_rules, summarize_quality
 from backend.type_analyzer import find_definite_type_errors
 from backend.validator import check_undefined_names
 

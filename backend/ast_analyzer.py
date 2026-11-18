@@ -7,6 +7,7 @@ import tokenize
 from io import StringIO
 
 from backend.rules import CC_THRESHOLD
+from backend.security_flows import find_dynamic_template_flows
 from backend.type_analyzer import find_definite_type_errors
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,15 @@ def _function_nesting_depth(function_node):
 
 
 def calculate_cc(tree_or_code):
-    """Calculate cyclomatic complexity from a Python AST node or source string."""
+    """Calculate an AST-derived cyclomatic complexity estimate from a Python AST node or source string.
+
+    This is a structural *estimate* based on counting branch-inducing AST nodes
+    (if/for/while/with/try/match/assert and boolean operator chains) rather than
+    a full control-flow-graph (CFG) analysis. A proper CFG traversal is not
+    performed; the result approximates the classic McCabe CC metric and is
+    accurate for the common case but may differ from tool-based CFG CC for
+    complex generators, comprehensions, or decorator-modified flow.
+    """
     if isinstance(tree_or_code, str):
         tree_or_code = ast.parse(tree_or_code)
 
@@ -114,6 +123,7 @@ def calculate_cc(tree_or_code):
         ast.AsyncFor,
         ast.AsyncWith,
         ast.match_case,
+        ast.Assert,
     )
     complexity = 1
     if isinstance(tree_or_code, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -231,6 +241,7 @@ def analyze_code(source_code):
             "todo_comments": [],
             "placeholder_blocks": [],
             "type_errors": [],
+            "template_injections": [],
             "module_docstring": False,
             "total_comments": 0,
             "warnings": [
@@ -503,6 +514,7 @@ def analyze_code(source_code):
         "todo_comments": todo_comments,
         "placeholder_blocks": placeholder_blocks,
         "type_errors": type_errors,
+        "template_injections": find_dynamic_template_flows(tree, source_code),
         "module_docstring": bool(ast.get_docstring(tree, clean=True)),
         "total_comments": total_comments,
     }
@@ -644,7 +656,7 @@ def _describe_function_semantics(node):
         return f"Function {node.name} accepts {argument_text} and returns {', '.join(returns[:3])}."
 
     yields = [
-        ast.unparse(child.value) if getattr(child, "value", None) else "values"
+        ast.unparse(child.value) if child.value is not None else "values"
         for child in _walk_function_scope(node)
         if isinstance(child, (ast.Yield, ast.YieldFrom))
     ]

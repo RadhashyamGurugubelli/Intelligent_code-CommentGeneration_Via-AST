@@ -34,8 +34,17 @@ def probe_security_vulnerabilities_handler(args: Dict[str, Any], context: Any) -
 def synthesize_defensive_patch_handler(args: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Synthesize hardened code remediating detected static security findings."""
     code = _resolve_code(args, context)
+    findings = args.get("findings", [])
+    if not isinstance(findings, list) or not all(
+        isinstance(item, dict) for item in findings
+    ):
+        raise ValueError("findings must be a list of structured finding objects.")
     model_client = getattr(context, "model_client", None) if context else None
     result = fix_attack_vulnerabilities(code, model_client=model_client)
+    mode = result.get("mode", "deterministic_ast")
+    model_configured = bool(
+        model_client is not None and getattr(model_client, "chat", None)
+    )
     return {
         "fixed": result.get("fixed", False),
         "fixed_code": result.get("fixed_code", code),
@@ -43,6 +52,20 @@ def synthesize_defensive_patch_handler(args: Dict[str, Any], context: Any) -> Di
         "remaining_count": result.get("remaining_count", 0),
         "defensive_controls": result.get("defensive_controls", []),
         "post_fix_resilience_score": result.get("post_fix_resilience_score", 100),
+        "patches": result.get("patches", []),
+        "diff": result.get("diff", ""),
+        "reported_finding_ids": [
+            item.get("finding_id") for item in findings if item.get("finding_id")
+        ],
+        "reported_findings_count": len(findings),
+        "execution_mode": "model" if mode == "ai" else "deterministic",
+        "fallback_reason": (
+            None
+            if mode == "ai" or result.get("status") == "already_secure"
+            else "model_candidate_unavailable_or_rejected"
+            if model_configured
+            else "model_provider_unavailable"
+        ),
     }
 
 

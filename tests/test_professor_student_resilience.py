@@ -65,6 +65,26 @@ class ResilienceAndProfessorStudentTests(unittest.TestCase):
         self.assertIn("High cyclomatic complexity", critique_text)
         self.assertIn("Missing docstring", critique_text)
 
+    def test_professor_student_adds_ast_docs_for_documented_class_methods(self):
+        source = (
+            "class Calculator:\n"
+            "    def add(self, a, b):\n"
+            "        \"\"\"Add values.\"\"\"\n"
+            "        result = a + b\n"
+            "        return result\n"
+            "\n"
+            "    def multiply(self, a, b):\n"
+            "        return a * b\n"
+        )
+
+        result = ProfessorStudentOrchestrator(max_iterations=1).run(source)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["code_modified"])
+        self.assertIn("# Defines class Calculator.", result["final_code"])
+        self.assertIn('"""', result["final_code"])
+        self.assertIn("multiply", result["final_code"])
+
     def test_professor_student_route_validates_and_bounds_iterations(self):
         code = "def add(a, b):\n    '''Add two numbers.'''\n    return a + b\n"
         resp = self.client.post(

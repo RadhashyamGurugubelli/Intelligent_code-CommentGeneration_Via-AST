@@ -33,6 +33,7 @@ def summarize_quality(warnings: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "SEC004": 25,
         "SEC005": 15,
         "SEC006": 35,
+        "SEC007": 35,
         "NAME001": 30,
         "SYNTAX001": 100,
     }
@@ -177,6 +178,24 @@ def apply_rules(analysis_dict: dict[str, Any]) -> list[Warning]:
                 "severity": "error",
                 "message": f"Potential hard-coded credential in '{secret.get('name')}'. Load secrets from a protected configuration source instead.",
                 "line": secret.get("lineno", 0),
+            }
+        )
+
+    for flow in analysis_dict.get("template_injections", []):
+        warnings.append(
+            {
+                "rule_id": "SEC007",
+                "severity": "error",
+                "message": (
+                    f"Untrusted Flask request data from line {flow.get('source_line', 0)} "
+                    f"flows into a dynamically constructed template at line "
+                    f"{flow.get('template_line', 0)} and is rendered by "
+                    f"{flow.get('sink', 'render_template_string')} at line "
+                    f"{flow.get('sink_line', 0)}. This can cause HTML injection/XSS "
+                    "and may enable server-side template injection. Use a regular "
+                    "template with a context variable so autoescaping applies."
+                ),
+                "line": flow.get("sink_line", 0),
             }
         )
 

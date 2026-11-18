@@ -3,6 +3,16 @@ name: Tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_browser_tests:
+        description: "Run Playwright browser tests in the browser-tests job"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
@@ -10,19 +20,60 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.15"
+          python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run test suite
         run: python -m pytest -q
+
+  browser-tests:
+    # Runs on workflow_dispatch (manual trigger) with run_browser_tests=true (the default),
+    # and also on every push/PR so that Playwright UI tests are part of normal CI.
+    # On push/PR the job always runs; on workflow_dispatch it is skipped only when
+    # the caller explicitly passes run_browser_tests=false.
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.run_browser_tests != 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt playwright
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run Playwright browser tests
+        run: python -m pytest -q --run-browser-tests

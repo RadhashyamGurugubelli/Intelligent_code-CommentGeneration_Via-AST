@@ -9,8 +9,15 @@ __pycache__/
 htmlcov/
 build/
 dist/
+instance/
+backups/
+*.sqlite*
+*.db
 .env*
 !.env.example
+*.bak
+*.swp
+*.orig
 Digraph.gv
 Digraph.gv.pdf
 TODO.txt

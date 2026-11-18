@@ -1,16 +1,18 @@
 """Shared Hugging Face, local Ollama, and GitHub Copilot model configuration."""
 
 import json
+import hashlib
 import logging
-import os
-import subprocess
+import threading
 from types import SimpleNamespace
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen
 
-from backend.config import AppConfig
+from backend.config import AppConfig, _resolve_github_token
+from backend.provider_errors import classify_provider_error
+from backend.security_ssrf import validate_url_against_ssrf
 
 try:
     from huggingface_hub import InferenceClient
@@ -19,9 +21,12 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+_PROVIDER_STATUS_LOCK = threading.Lock()
+_LAST_PROVIDER_TEST = None
 
-def _get_active_model_name():
-    p = AppConfig.AI_PROVIDER
+
+def _get_active_model_name(provider=None):
+    p = (provider or AppConfig.AI_PROVIDER).strip().lower()
     if p == "copilot":
         return AppConfig.COPILOT_MODEL
     if p == "openai":
@@ -42,6 +47,40 @@ def _get_active_model_name():
 MODEL_NAME = _get_active_model_name()
 
 
+def provider_extra_body(provider_id=None) -> dict:
+    """Return provider-specific extra body parameters.
+
+    Returns {"chat_template_kwargs": {"enable_thinking": False}} exclusively for
+    the 'huggingface' provider and {} for all other providers (copilot, openai,
+    gemini, groq, anthropic, ollama, ast).
+    """
+    p = (provider_id or AppConfig.AI_PROVIDER or "").strip().lower()
+    if p in {"huggingface", "hf"}:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {}
+
+_BASE_URL_ATTRIBUTES = {
+    "copilot": "COPILOT_BASE_URL",
+    "openai": "OPENAI_BASE_URL",
+    "gemini": "GEMINI_BASE_URL",
+    "groq": "GROQ_BASE_URL",
+    "anthropic": "ANTHROPIC_BASE_URL",
+    "ollama": "OLLAMA_BASE_URL",
+}
+_DEFAULT_BASE_URLS = {
+    provider: getattr(AppConfig, attribute)
+    for provider, attribute in _BASE_URL_ATTRIBUTES.items()
+}
+_PROVIDER_KEY_ATTRIBUTES = {
+    "huggingface": "HF_TOKEN",
+    "copilot": "COPILOT_TOKEN",
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+}
+
+
 class ModelRequestError(RuntimeError):
     def __init__(self, message, status_code=None):
         super().__init__(message)
@@ -53,7 +92,14 @@ class CopilotRequestError(ModelRequestError):
 
 
 class OpenAICompatibleCompletions:
-    def __init__(self, api_key, base_url, model_name, custom_headers=None, timeout=120):
+    def __init__(
+        self,
+        api_key,
+        base_url,
+        model_name,
+        custom_headers=None,
+        timeout: float = 120,
+    ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
@@ -89,6 +135,11 @@ class OpenAICompatibleCompletions:
         headers.update(self.custom_headers)
 
         endpoint = f"{self.base_url}/chat/completions"
+        allow_local = "ollama" in self.base_url or "127.0.0.1" in self.base_url or "localhost" in self.base_url
+        is_safe, reason = validate_url_against_ssrf(endpoint, allow_local=allow_local)
+        if not is_safe:
+            raise ModelRequestError(f"SSRF protection blocked request to '{endpoint}': {reason}", 403)
+
         data = json.dumps(payload).encode("utf-8")
         req = urllib_request.Request(endpoint, data=data, headers=headers, method="POST")
         try:
@@ -142,7 +193,7 @@ class CopilotCompletions(OpenAICompatibleCompletions):
 
 
 class AnthropicCompletions:
-    def __init__(self, api_key, base_url, model_name, timeout=120):
+    def __init__(self, api_key, base_url, model_name, timeout: float = 120):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
@@ -179,6 +230,11 @@ class AnthropicCompletions:
             "accept": "application/json",
         }
         endpoint = f"{self.base_url}/messages"
+        allow_local = "127.0.0.1" in self.base_url or "localhost" in self.base_url
+        is_safe, reason = validate_url_against_ssrf(endpoint, allow_local=allow_local)
+        if not is_safe:
+            raise ModelRequestError(f"SSRF protection blocked request to '{endpoint}': {reason}", 403)
+
         data = json.dumps(payload).encode("utf-8")
         req = urllib_request.Request(endpoint, data=data, headers=headers, method="POST")
         try:
@@ -217,84 +273,102 @@ class UniversalClient:
         self.chat = SimpleNamespace(completions=completions_obj)
 
 
-def _resolve_copilot_token():
-    token = AppConfig.API_KEY.strip() if AppConfig.API_KEY else ""
-    if token:
-        return token
-    for cmd in (("gh", "auth", "token"), ("github-copilot-cli", "auth", "token")):
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        except FileNotFoundError:
-            continue
-        if result.returncode == 0:
-            token = result.stdout.strip()
-            if token:
-                return token
+def _provider_api_key(provider, api_key_override=None):
+    """Resolve only credentials intended for the selected provider."""
+    if api_key_override:
+        return str(api_key_override).strip()
+    if (
+        provider == AppConfig.API_KEY_PROVIDER
+        and AppConfig.API_KEY
+        and AppConfig.API_KEY.strip()
+    ):
+        return AppConfig.API_KEY.strip()
+    attribute = _PROVIDER_KEY_ATTRIBUTES.get(provider)
+    if attribute:
+        key = getattr(AppConfig, attribute, "")
+        if key and key.strip():
+            return key.strip()
+    if provider == "copilot":
+        for attribute in ("GITHUB_TOKEN", "GH_TOKEN"):
+            key = getattr(AppConfig, attribute, "")
+            if key and key.strip():
+                return key.strip()
+        return _resolve_github_token()
     return ""
 
 
-def create_model_client(provider_override=None, api_key_override=None, model_override=None):
+def _provider_base_url(provider, override=None):
+    attribute = _BASE_URL_ATTRIBUTES.get(provider)
+    if attribute is None:
+        return None
+    if isinstance(override, str) and override.strip():
+        return override.strip().rstrip("/")
+    return getattr(AppConfig, attribute)
+
+
+def create_model_client(
+    provider_override=None,
+    api_key_override=None,
+    model_override=None,
+    base_url_override=None,
+):
     """Create the configured provider client."""
     provider = (provider_override or AppConfig.AI_PROVIDER).strip().lower()
-    api_key = api_key_override or AppConfig.API_KEY
+    api_key = _provider_api_key(provider, api_key_override)
 
     if provider == "ast":
         return None
 
     if provider == "copilot":
-        token = api_key_override or _resolve_copilot_token()
+        token = api_key
         if not token:
             return None
         return CopilotClient(
             api_key=token,
-            base_url=AppConfig.COPILOT_BASE_URL,
+            base_url=_provider_base_url(provider, base_url_override),
             model_name=model_override or AppConfig.COPILOT_MODEL,
         )
 
     if provider == "openai":
-        key = api_key or AppConfig.OPENAI_API_KEY
-        if not key:
+        if not api_key:
             return None
         return UniversalClient(
             OpenAICompatibleCompletions(
-                api_key=key,
-                base_url=AppConfig.OPENAI_BASE_URL,
+                api_key=api_key,
+                base_url=_provider_base_url(provider, base_url_override),
                 model_name=model_override or AppConfig.OPENAI_MODEL,
             )
         )
 
     if provider == "gemini":
-        key = api_key or AppConfig.GEMINI_API_KEY
-        if not key:
+        if not api_key:
             return None
         return UniversalClient(
             OpenAICompatibleCompletions(
-                api_key=key,
-                base_url=AppConfig.GEMINI_BASE_URL,
+                api_key=api_key,
+                base_url=_provider_base_url(provider, base_url_override),
                 model_name=model_override or AppConfig.GEMINI_MODEL,
             )
         )
 
     if provider == "groq":
-        key = api_key or AppConfig.GROQ_API_KEY
-        if not key:
+        if not api_key:
             return None
         return UniversalClient(
             OpenAICompatibleCompletions(
-                api_key=key,
-                base_url=AppConfig.GROQ_BASE_URL,
+                api_key=api_key,
+                base_url=_provider_base_url(provider, base_url_override),
                 model_name=model_override or AppConfig.GROQ_MODEL,
             )
         )
 
     if provider == "anthropic":
-        key = api_key or AppConfig.ANTHROPIC_API_KEY
-        if not key:
+        if not api_key:
             return None
         return UniversalClient(
             AnthropicCompletions(
-                api_key=key,
-                base_url=AppConfig.ANTHROPIC_BASE_URL,
+                api_key=api_key,
+                base_url=_provider_base_url(provider, base_url_override),
                 model_name=model_override or AppConfig.ANTHROPIC_MODEL,
             )
         )
@@ -303,7 +377,7 @@ def create_model_client(provider_override=None, api_key_override=None, model_ove
         return UniversalClient(
             OpenAICompatibleCompletions(
                 api_key="ollama",
-                base_url=AppConfig.OLLAMA_BASE_URL,
+                base_url=_provider_base_url(provider, base_url_override),
                 model_name=model_override or AppConfig.OLLAMA_MODEL,
                 timeout=AppConfig.OLLAMA_TIMEOUT,
             )
@@ -323,8 +397,8 @@ def provider_ready(client):
         return True
     if client is None:
         return False
-    if AppConfig.AI_PROVIDER in {"copilot", "openai", "gemini", "groq", "anthropic"}:
-        return bool(AppConfig.API_KEY)
+    if AppConfig.AI_PROVIDER in _PROVIDER_KEY_ATTRIBUTES:
+        return bool(_provider_api_key(AppConfig.AI_PROVIDER))
     if AppConfig.AI_PROVIDER != "ollama":
         return True
 
@@ -349,6 +423,56 @@ def provider_ready(client):
     )
 
 
+def _provider_config_signature(provider, api_key=None, model=None, base_url=None):
+    resolved_model = model or _get_active_model_name(provider)
+    resolved_base_url = _provider_base_url(provider, base_url) or ""
+    resolved_key = _provider_api_key(provider, api_key)
+    signature_input = "\0".join(
+        (provider, resolved_model, resolved_base_url, resolved_key)
+    ).encode("utf-8")
+    return hashlib.sha256(signature_input).hexdigest()
+
+
+def _provider_is_configured(provider):
+    if provider == "ast":
+        return False
+    if provider in _PROVIDER_KEY_ATTRIBUTES:
+        return bool(_provider_api_key(provider))
+    return create_model_client(provider_override=provider) is not None
+
+
+def _remember_provider_test(provider, signature, success, error=None):
+    if provider != AppConfig.AI_PROVIDER:
+        return
+    if signature != _provider_config_signature(provider):
+        return
+    global _LAST_PROVIDER_TEST
+    with _PROVIDER_STATUS_LOCK:
+        _LAST_PROVIDER_TEST = {
+            "signature": signature,
+            "success": success,
+            "error": error,
+        }
+
+
+def provider_connection_status():
+    """Return a truthful status for the currently selected provider profile."""
+    provider = AppConfig.AI_PROVIDER.strip().lower()
+    if provider == "ast":
+        return "AST MODE", "Deterministic analysis is active; no external model is used."
+    if not _provider_is_configured(provider):
+        return "NOT CONFIGURED", "Configure credentials or a local model before using AI."
+
+    signature = _provider_config_signature(provider)
+    with _PROVIDER_STATUS_LOCK:
+        last_test = _LAST_PROVIDER_TEST
+        if last_test and last_test["signature"] == signature:
+            if last_test["success"]:
+                return "CONNECTED", "The current provider settings passed a live request."
+            return "FAILED", last_test["error"]
+    return "CONFIGURED / NOT TESTED", "Credentials are configured; run Test Provider to verify connectivity."
+
+
 def provider_display_name(provider=None):
     """Return a user-facing name for the configured AI provider."""
     p = (provider or AppConfig.AI_PROVIDER).strip().lower()
@@ -371,28 +495,48 @@ def test_provider_connectivity(provider, api_key=None, model=None, base_url=None
 
     started = time.perf_counter()
     p = provider.strip().lower()
+    signature = _provider_config_signature(p, api_key, model, base_url)
     if p == "ast":
         return {
             "success": True,
             "latency_ms": 0.5,
             "provider": "Deterministic AST Engine",
             "model": "Zero-Cloud Offline AST",
+            "provider_status": "AST MODE",
         }
+
+    if base_url:
+        is_safe, reason = validate_url_against_ssrf(
+            base_url,
+            allow_local=(p == "ollama"),
+            provider=p,
+        )
+        if not is_safe:
+            return {
+                "success": False,
+                "error": f"Invalid provider URL (SSRF blocked): {reason}",
+                "provider": provider_display_name(p),
+            }
 
     temp_client = create_model_client(
         provider_override=p,
         api_key_override=api_key,
         model_override=model,
+        base_url_override=base_url,
     )
     if not temp_client:
-        return {
+        result = {
             "success": False,
             "error": f"API key is missing or could not initialize client for {p}.",
+            "provider": provider_display_name(p),
+            "provider_status": "NOT CONFIGURED",
         }
+        _remember_provider_test(p, signature, False, result["error"])
+        return result
 
     try:
         if hasattr(temp_client, "chat"):
-            target_model = model or _get_active_model_name()
+            target_model = model or _get_active_model_name(p)
             resp = temp_client.chat.completions.create(
                 model=target_model,
                 messages=[{"role": "user", "content": "Respond with 'OK'"}],
@@ -400,24 +544,44 @@ def test_provider_connectivity(provider, api_key=None, model=None, base_url=None
                 temperature=0.0,
             )
             content = resp.choices[0].message.content or ""
-        elif hasattr(temp_client, "text_generation"):
-            content = temp_client.text_generation("Respond with 'OK'", max_new_tokens=5)
+        elif callable(getattr(temp_client, "text_generation", None)):
+            text_generation = getattr(temp_client, "text_generation")
+            content = text_generation("Respond with 'OK'", max_new_tokens=5)
         else:
-            content = "OK"
+            raise RuntimeError("The configured provider client has no completion interface.")
+
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError("The provider returned an empty connectivity response.")
 
         elapsed = round((time.perf_counter() - started) * 1000, 1)
-        return {
+        result = {
             "success": True,
             "latency_ms": elapsed,
             "provider": provider_display_name(p),
-            "model": model or _get_active_model_name(),
+            "model": model or _get_active_model_name(p),
             "sample_response": content.strip()[:60],
+            "provider_status": "CONNECTED",
         }
+        _remember_provider_test(p, signature, True)
+        return result
     except Exception as exc:
+        classified = classify_provider_error(exc, provider_display_name(p))
+        safe_error = (
+            classified[0]["error"]
+            if classified
+            else "Provider request failed. Check network access, model availability, and provider settings."
+        )
+        logger.warning(
+            "Provider connectivity test failed provider=%s error_type=%s",
+            p,
+            type(exc).__name__,
+        )
+        _remember_provider_test(p, signature, False, safe_error)
         return {
             "success": False,
-            "error": str(exc),
+            "error": safe_error,
             "provider": provider_display_name(p),
+            "provider_status": "FAILED",
         }
 
 
@@ -426,23 +590,26 @@ def get_current_settings():
     from backend.config import SUPPORTED_PROVIDERS
 
     p = AppConfig.AI_PROVIDER
-    has_key = bool(
-        AppConfig.API_KEY
-        or (p == "openai" and AppConfig.OPENAI_API_KEY)
-        or (p == "gemini" and AppConfig.GEMINI_API_KEY)
-        or (p == "groq" and AppConfig.GROQ_API_KEY)
-        or (p == "anthropic" and AppConfig.ANTHROPIC_API_KEY)
-        or (p in {"ast", "ollama"})
-    )
+    has_key = p in {"ast", "ollama"} or bool(_provider_api_key(p))
+    base_url_attribute = _BASE_URL_ATTRIBUTES.get(p)
+    provider_status, provider_status_detail = provider_connection_status()
     return {
         "provider": p,
         "provider_display": provider_display_name(p),
         "model": _get_active_model_name(),
+        "base_url": (
+            getattr(AppConfig, base_url_attribute)
+            if base_url_attribute
+            else ""
+        ),
+        "supports_base_url": base_url_attribute is not None,
         "docstring_style": AppConfig.DOCSTRING_STYLE,
         "supported_providers": sorted(list(SUPPORTED_PROVIDERS)),
         "supported_styles": ["google", "sphinx", "numpy", "standard"],
         "has_api_key": has_key,
         "ai_ready": provider_ready(None if p == "ast" else create_model_client()),
+        "provider_status": provider_status,
+        "provider_status_detail": provider_status_detail,
     }
 
 
@@ -466,7 +633,7 @@ def update_provider_settings(
 
     if api_key is not None:
         key_str = str(api_key).strip()
-        AppConfig.API_KEY = key_str
+        AppConfig.API_KEY_PROVIDER = active_p
         if active_p == "openai":
             AppConfig.OPENAI_API_KEY = key_str
         elif active_p == "gemini":
@@ -475,6 +642,10 @@ def update_provider_settings(
             AppConfig.GROQ_API_KEY = key_str
         elif active_p == "anthropic":
             AppConfig.ANTHROPIC_API_KEY = key_str
+        elif active_p == "copilot":
+            AppConfig.COPILOT_TOKEN = key_str
+        elif active_p == "huggingface":
+            AppConfig.HF_TOKEN = key_str
 
     if model:
         m_str = str(model).strip()
@@ -493,20 +664,22 @@ def update_provider_settings(
         elif active_p == "huggingface":
             AppConfig.HF_MODEL = m_str
 
-    if base_url:
-        b_str = str(base_url).strip()
-        if active_p == "ollama":
-            AppConfig.OLLAMA_BASE_URL = b_str
-        elif active_p == "openai":
-            AppConfig.OPENAI_BASE_URL = b_str
-        elif active_p == "gemini":
-            AppConfig.GEMINI_BASE_URL = b_str
-        elif active_p == "groq":
-            AppConfig.GROQ_BASE_URL = b_str
-        elif active_p == "anthropic":
-            AppConfig.ANTHROPIC_BASE_URL = b_str
-        elif active_p == "copilot":
-            AppConfig.COPILOT_BASE_URL = b_str
+    base_url_attribute = _BASE_URL_ATTRIBUTES.get(active_p)
+    if base_url is not None and base_url_attribute:
+        base_url_value = str(base_url).strip().rstrip("/")
+        if base_url_value:
+            is_safe, reason = validate_url_against_ssrf(
+                base_url_value,
+                allow_local=(active_p == "ollama"),
+                provider=active_p,
+            )
+            if not is_safe:
+                raise ValueError(f"SSRF validation blocked provider base URL: {reason}")
+        setattr(
+            AppConfig,
+            base_url_attribute,
+            base_url_value or _DEFAULT_BASE_URLS[active_p],
+        )
 
     if docstring_style:
         style_str = str(docstring_style).strip().lower()
@@ -514,15 +687,22 @@ def update_provider_settings(
             AppConfig.DOCSTRING_STYLE = style_str
 
     MODEL_NAME = _get_active_model_name()
-
-    try:
-        import backend.code_analysis as ca
-
-        ca.client = create_model_client()
-        ca.MODEL_NAME = MODEL_NAME
-    except Exception as exc:
-        logger.warning("Could not refresh ca.client: %s", exc)
+    _refresh_runtime_clients()
+    global _LAST_PROVIDER_TEST
+    with _PROVIDER_STATUS_LOCK:
+        _LAST_PROVIDER_TEST = None
 
     return get_current_settings()
 
 
+def _refresh_runtime_clients():
+    """Apply updated provider settings to the long-lived app and agent runtimes."""
+    model_client = create_model_client()
+
+    import backend.app as app_module
+    import backend.code_analysis as code_analysis_module
+    from backend.agentic.routes import _runtime
+
+    code_analysis_module.client = model_client
+    app_module.client = model_client
+    _runtime.set_model_client(model_client, MODEL_NAME)

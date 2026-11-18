@@ -64,6 +64,8 @@ class BackendContractTests(unittest.TestCase):
             "test-token", "https://api.githubcopilot.com", "gpt-4o"
         )
         with patch(
+            "backend.model_provider.validate_url_against_ssrf", return_value=(True, "OK")
+        ), patch(
             "backend.model_provider.urllib_request.urlopen", return_value=response
         ) as open_url:
             result = completions.create(
@@ -93,6 +95,29 @@ class BackendContractTests(unittest.TestCase):
         stylesheet.close()
         script.close()
 
+    def test_agentic_status_reports_actual_runtime_and_specialist_configuration(self):
+        from backend.app import app
+
+        with app.test_client() as http_client:
+            response = http_client.get("/agentic/status")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["orchestrator"]["name"], "NEXUS")
+        self.assertEqual(payload["registered_agent_count"], 6)
+        self.assertEqual(
+            {agent["name"] for agent in payload["agents"]},
+            {"ATLAS", "FORGE", "SENTINEL", "REMEDY", "SCRIBE", "VERITY"},
+        )
+        self.assertTrue(all(agent["model"] for agent in payload["agents"]))
+        self.assertTrue(
+            {
+                "active_executions",
+                "completed_tasks",
+                "failed_tasks",
+            }.issubset(payload["statistics"])
+        )
+
     def test_app_factory_registers_feature_blueprints_with_isolated_config(self):
         from backend.app import app, create_app
 
@@ -116,6 +141,8 @@ class BackendContractTests(unittest.TestCase):
                 "assistant",
                 "artifacts",
                 "agentic",
+                "project_workbench",
+                "monitoring",
             },
         )
         self.assertEqual(app.config["MAX_SOURCE_LENGTH"], 50_000)
@@ -380,6 +407,120 @@ class BackendContractTests(unittest.TestCase):
             payload["attack_detection"]["categories"],
         )
         pipeline.assert_not_called()
+        self.assertIn("[AST-SECURITY]", payload["preview_security_annotated_code"])
+
+    def test_generate_remediates_before_commenting_and_returns_security_annotations(self):
+        from unittest.mock import patch
+
+        import backend.app as app_module
+        from backend.pipeline import run_pipeline
+
+        vulnerable_code = (
+            "def get_user(user_id):\n"
+            "    query = f\"SELECT * FROM users WHERE id = {user_id}\"\n"
+            "    return db.execute(query)\n"
+        )
+        hardened_code = (
+            "def get_user(user_id):\n"
+            "    query = \"SELECT * FROM users WHERE id = ?\"\n"
+            "    return db.execute(query, (user_id,))\n"
+        )
+        defensive_controls = [
+            "Use parameterized queries with placeholders (? or %s) instead of string formatting."
+        ]
+        fix_result = {
+            "fixed_code": hardened_code,
+            "defensive_controls": defensive_controls,
+            "status": "completed",
+            "remaining_vulnerabilities": 0,
+            "verification": {
+                "syntax_valid": True,
+                "definitions_preserved": True,
+                "all_detected_static_findings_addressed": True,
+            },
+        }
+
+        with (
+            patch("backend.app.fix_attack_vulnerabilities", return_value=fix_result) as fixer,
+            patch("backend.app.run_pipeline", wraps=run_pipeline) as pipeline,
+            patch(
+                "backend.pipeline.generate_commented_code",
+                return_value=(hardened_code, "ai"),
+            ),
+            app_module.app.test_client() as http_client,
+        ):
+            response = http_client.post(
+                "/generate",
+                json={
+                    "code": vulnerable_code,
+                    "remediate_and_comment": True,
+                },
+            )
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        fixer.assert_called_once_with(vulnerable_code, model_client=app_module.client)
+        pipeline.assert_called_once()
+        self.assertEqual(pipeline.call_args.args[0], hardened_code)
+        self.assertEqual(
+            pipeline.call_args.kwargs["security_controls"], defensive_controls
+        )
+        self.assertTrue(payload["remediated_before_commenting"])
+        self.assertEqual(payload["original_code"], vulnerable_code)
+        self.assertEqual(payload["security_fixes_applied"], defensive_controls)
+        self.assertIn(
+            "[AST-SECURITY] Binds SQL values separately from the query",
+            payload["commented_code"],
+        )
+        self.assertIn("?", payload["commented_code"])
+        self.assertIn("quality_score", payload)
+        self.assertIn("analysis", payload)
+
+    def test_generate_rejects_non_boolean_remediation_flag(self):
+        from backend.app import app
+
+        with app.test_client() as http_client:
+            response = http_client.post(
+                "/generate",
+                json={
+                    "code": "def add(left, right):\n    return left + right\n",
+                    "remediate_and_comment": "true",
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("must be a boolean", response.get_json()["error"])
+
+    def test_generate_uses_verified_deterministic_remediation_without_provider(self):
+        from unittest.mock import patch
+
+        from backend.app import app
+
+        vulnerable_code = (
+            "def get_user(user_id):\n"
+            "    query = f\"SELECT * FROM users WHERE id = {user_id}\"\n"
+            "    return db.execute(query)\n"
+        )
+        with patch("backend.app.client", None), app.test_client() as http_client:
+            response = http_client.post(
+                "/generate",
+                json={
+                    "code": vulnerable_code,
+                    "remediate_and_comment": True,
+                },
+            )
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["remediated_before_commenting"])
+        self.assertIn("db.execute(query, (user_id,))", payload["commented_code"])
+        self.assertIn(
+            "[AST-SECURITY] Binds SQL values separately from the query",
+            payload["commented_code"],
+        )
+        self.assertEqual(
+            payload["security_remediation"]["remaining_vulnerabilities"], 0
+        )
 
     def test_cors_is_same_origin_by_default_and_explicitly_allowlisted(self):
         from backend.app import app
@@ -497,7 +638,6 @@ class BackendContractTests(unittest.TestCase):
             ("/agent/optimize", "optimize_code"),
             ("/agent/simulate-attacks", "simulate_attacks"),
             ("/agent/fix-attacks", "fix_attack_vulnerabilities"),
-            ("/agent/multi-agent-workflow", "run_multi_agent_workflow"),
         )
         factory_app = app_module.create_app(
             {"TESTING": True, "REQUIRE_API_KEY": True, "API_KEY": "review-test-key"}
@@ -526,6 +666,67 @@ class BackendContractTests(unittest.TestCase):
                 self.assertEqual(allowed.status_code, 200)
                 self.assertEqual(allowed.get_json(), {"reached": True})
                 handler.assert_called_once()
+
+        workflow_result = {
+            "status": "completed",
+            "final_code": source,
+            "audit_passed": True,
+            "execution_mode": "model",
+            "model_call_count": 1,
+            "results": [],
+            "tasks": {},
+            "tool_observations": [],
+        }
+        with (
+            patch.object(app_module, "agentic_model_ready", return_value=True),
+            patch.object(
+                app_module, "run_agentic_workflow_sync", return_value=workflow_result
+            ) as handler,
+        ):
+            with factory_app.test_client() as http_client:
+                missing = http_client.post(
+                    "/agent/multi-agent-workflow", json={"code": source}
+                )
+                wrong = http_client.post(
+                    "/agent/multi-agent-workflow",
+                    json={"code": source},
+                    headers={"Authorization": "Bearer wrong-key"},
+                )
+                allowed = http_client.post(
+                    "/agent/multi-agent-workflow",
+                    json={"code": source},
+                    headers={"Authorization": "Bearer review-test-key"},
+                )
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(wrong.status_code, 401)
+        self.assertEqual(allowed.status_code, 200)
+        handler.assert_called_once()
+
+    def test_agentic_session_endpoints_require_key_when_enforced(self):
+        import backend.app as app_module
+
+        factory_app = app_module.create_app(
+            {"TESTING": True, "REQUIRE_API_KEY": True, "API_KEY": "agentic-test-key"}
+        )
+        routes = (
+            ("get", "/agentic/session/nonexistent"),
+            ("get", "/agentic/stream/nonexistent"),
+            ("post", "/agentic/action"),
+        )
+
+        with factory_app.test_client() as http_client:
+            for method, path in routes:
+                with self.subTest(path=path):
+                    request_kwargs = {"json": {}} if method == "post" else {}
+                    response = getattr(http_client, method)(path, **request_kwargs)
+                    self.assertEqual(response.status_code, 401)
+
+                    authenticated = getattr(http_client, method)(
+                        path,
+                        headers={"Authorization": "Bearer agentic-test-key"},
+                        **request_kwargs,
+                    )
+                    self.assertNotEqual(authenticated.status_code, 401)
 
     def test_model_agent_routes_return_503_without_server_key(self):
         import backend.app as app_module
@@ -559,7 +760,6 @@ class BackendContractTests(unittest.TestCase):
             ("/agent/optimize", "optimize_code"),
             ("/agent/simulate-attacks", "simulate_attacks"),
             ("/agent/fix-attacks", "fix_attack_vulnerabilities"),
-            ("/agent/multi-agent-workflow", "run_multi_agent_workflow"),
         )
         for path, handler_name in routes:
             with self.subTest(path=path), patch(
@@ -569,6 +769,30 @@ class BackendContractTests(unittest.TestCase):
                     response = http_client.post(path, json={"code": "value = 1\n"})
                 self.assertEqual(response.status_code, 200)
                 handler.assert_called_once()
+
+        workflow_result = {
+            "status": "completed",
+            "final_code": "value = 1\n",
+            "audit_passed": True,
+            "execution_mode": "model",
+            "model_call_count": 1,
+            "results": [],
+            "tasks": {},
+            "tool_observations": [],
+        }
+        with (
+            patch.object(app_module, "agentic_model_ready", return_value=True),
+            patch.object(
+                app_module, "run_agentic_workflow_sync", return_value=workflow_result
+            ) as handler,
+        ):
+            with factory_app.test_client() as http_client:
+                response = http_client.post(
+                    "/agent/multi-agent-workflow",
+                    json={"code": "value = 1\n"},
+                )
+        self.assertEqual(response.status_code, 200)
+        handler.assert_called_once()
 
     def test_when_api_key_is_required_and_not_configured_requests_are_blocked(self):
         from backend.app import app
@@ -671,7 +895,7 @@ class BackendContractTests(unittest.TestCase):
 
         self.assertEqual(method, "ast")
         self.assertNotIn("Ignore previous instructions", generated)
-        self.assertIn("Accepts left, right", generated)
+        self.assertIn("Add the input", generated)
 
     def test_oversized_http_body_returns_json_error(self):
         from backend.app import app
@@ -893,6 +1117,92 @@ class User:
 
         self.assertTrue(validate_generated_code(original, generated)["is_valid"])
 
+    def test_validation_matches_existing_docstrings_after_comment_line_shifts(self):
+        source = (
+            'class Orders:\n'
+            '    """Order operations."""\n'
+            '    def get(self, order_id):\n'
+            '        """Return one order."""\n'
+            '        return order_id\n'
+        )
+        generated = _fallback_comment_code(source, analyze_code(source))
+
+        self.assertIn("# Defines class Orders.", generated)
+        self.assertTrue(validate_generated_code(source, generated)["is_valid"])
+
+    def test_validation_only_allows_explicit_short_docstring_enrichment(self):
+        source = (
+            'def calculate(amount: float) -> float:\n'
+            '    """Calculate the result."""\n'
+            '    return amount * 2\n'
+        )
+        generated = _fallback_comment_code(
+            source, docstring_style="google", enrich_existing=True
+        )
+
+        self.assertIn("Calculate the result.", generated)
+        self.assertIn("Args:", generated)
+        self.assertIn("Returns:", generated)
+        self.assertFalse(validate_generated_code(source, generated)["is_valid"])
+        self.assertTrue(
+            validate_generated_code(
+                source, generated, allow_docstring_enrichment=True
+            )["is_valid"]
+        )
+
+    def test_fallback_adds_security_and_ast_grounded_comments_and_docstrings(self):
+        source = (
+            "import os\n"
+            "import sqlite3\n"
+            "import requests\n"
+            "import subprocess\n"
+            "import pickle\n"
+            "import re\n"
+            "\n"
+            "class Loader:\n"
+            "    def load(self, path, values):\n"
+            "        token = os.getenv('TOKEN')\n"
+            "        data = [value for value in values if value]\n"
+            "        try:\n"
+            "            handle = open(path)\n"
+            "            return pickle.loads(handle.read())\n"
+            "        except OSError as error:\n"
+            "            raise RuntimeError(error)\n"
+        )
+        generated = _fallback_comment_code(source, docstring_style="google")
+
+        self.assertIn('"""Represents the Loader class.', generated)
+        self.assertIn('"""Load the input.', generated)
+        self.assertIn("Security & AST Complexity:", generated)
+        self.assertIn("Security review: inspect open", generated)
+        self.assertIn("Security review: inspect pickle.loads", generated)
+        self.assertIn("comprehension", generated)
+        self.assertIn("# Handles OSError as error", generated)
+        self.assertTrue(validate_generated_code(source, generated)["is_valid"])
+
+    def test_function_security_note_is_added_above_complexity_threshold(self):
+        source = (
+            "def classify(value):\n"
+            "    if value > 0:\n"
+            "        value += 1\n"
+            "    if value > 1:\n"
+            "        value += 1\n"
+            "    if value > 2:\n"
+            "        value += 1\n"
+            "    if value > 3:\n"
+            "        value += 1\n"
+            "    if value > 4:\n"
+            "        value += 1\n"
+            "    return value\n"
+        )
+        function_node = analysis_module.ast.parse(source).body[0]
+        metadata = analysis_module._extract_function_metadata(function_node)
+        generated = _fallback_comment_code(source)
+
+        self.assertGreater(metadata["cyclomatic_complexity"], 5)
+        self.assertIn("Security & AST Complexity:", generated)
+        self.assertIn("cyclomatic complexity is 6", generated)
+
     def test_validation_rejects_code_python_cannot_compile(self):
         from backend.validator import validate_code
 
@@ -1020,7 +1330,7 @@ class User:
         generated = _fallback_comment_code(source, analyze_code(source))
 
         self.assertIn('"""', generated)
-        self.assertIn("Accepts value", generated)
+        self.assertIn("Execute real", generated)
         self.assertIn("If value is truthy", generated)
         self.assertNotIn('"""\\n    Accepts no explicit arguments', generated)
         self.assertTrue(validate_generated_code(source, generated)["is_valid"])
@@ -1724,7 +2034,7 @@ class User:
         generated_payload = generated.get_json()
         self.assertEqual(generated_payload["ai_status"], "ast")
         self.assertIn("AI provider was unavailable", generated_payload["generation_notice"])
-        self.assertIn("Accepts payments, refunds", generated_payload["commented_code"])
+        self.assertIn("Reconcile payments", generated_payload["commented_code"])
         self.assertTrue(generated_payload["validation"]["is_valid"])
         self.assertEqual(analyzed.status_code, 200)
         self.assertEqual(analyzed.get_json()["analysis"]["functions"][0]["name"], "reconcile_payments")
@@ -1844,7 +2154,7 @@ class User:
         payload = response.get_json()
         self.assertEqual(payload["ai_status"], "ast")
         self.assertIn("provider credits", payload["generation_notice"])
-        self.assertIn("Accepts a, b", payload["commented_code"])
+        self.assertIn("Add the input", payload["commented_code"])
         self.assertTrue(payload["validation"]["is_valid"])
 
     def test_model_prompt_requests_detailed_grounded_comments(self):
@@ -2205,6 +2515,80 @@ class User:
         generated = _fallback_comment_code(source, analyze_code(source))
         self.assertIn("otherwise returns 0", generated)
         self.assertNotIn("otherwise returns 7", generated)
+
+    def test_hermetic_environment_blocks_external_dns_and_resets_provider(self):
+        import socket
+        import os
+
+        self.assertEqual(os.environ.get("AI_PROVIDER"), "ast")
+        self.assertIsNone(os.environ.get("API_KEY"))
+        self.assertIsNone(os.environ.get("GITHUB_TOKEN"))
+
+        with self.assertRaises(socket.gaierror):
+            socket.getaddrinfo("unmocked-external-domain.example", 443)
+
+        # Local loopback remains resolvable
+        res = socket.getaddrinfo("127.0.0.1", 80)
+        self.assertTrue(len(res) > 0)
+
+    def test_each_provider_builds_client_config_with_correct_base_url_key_and_extra_body(self):
+        from unittest.mock import patch
+        from backend.config import AppConfig
+        from backend.model_provider import (
+            create_model_client,
+            provider_extra_body,
+            _provider_base_url,
+            _provider_api_key,
+        )
+
+        providers_spec = [
+            ("huggingface", "HF_TOKEN", "hf_test_token_123", None, {"chat_template_kwargs": {"enable_thinking": False}}),
+            ("copilot", "COPILOT_TOKEN", "copilot_test_token_456", AppConfig.COPILOT_BASE_URL, {}),
+            ("openai", "OPENAI_API_KEY", "sk-openai-test-789", AppConfig.OPENAI_BASE_URL, {}),
+            ("gemini", "GEMINI_API_KEY", "gemini-test-key-abc", AppConfig.GEMINI_BASE_URL, {}),
+            ("groq", "GROQ_API_KEY", "gsk-groq-test-def", AppConfig.GROQ_BASE_URL, {}),
+            ("anthropic", "ANTHROPIC_API_KEY", "sk-ant-test-ghi", AppConfig.ANTHROPIC_BASE_URL, {}),
+            ("ollama", None, None, AppConfig.OLLAMA_BASE_URL, {}),
+            ("ast", None, None, None, {}),
+        ]
+
+        for provider, key_attr, token, expected_url, expected_eb in providers_spec:
+            # 1. Verify provider_extra_body returns expected extra_body dict
+            self.assertEqual(
+                provider_extra_body(provider),
+                expected_eb,
+                f"Provider {provider} returned unexpected extra_body",
+            )
+
+            # 2. Verify base URL mapping
+            self.assertEqual(
+                _provider_base_url(provider),
+                expected_url,
+                f"Provider {provider} returned unexpected base URL",
+            )
+
+            # 3. Verify key resolution and client construction
+            if provider == "huggingface":
+                with patch.object(AppConfig, key_attr, token):
+                    self.assertEqual(_provider_api_key(provider), token)
+                    client = create_model_client(provider_override=provider)
+                    self.assertIsNotNone(client)
+                    self.assertEqual(getattr(client, "token", None), token)
+            elif provider == "ollama":
+                client = create_model_client(provider_override="ollama")
+                self.assertIsNotNone(client)
+                self.assertEqual(client.chat.completions.base_url, expected_url)
+                self.assertEqual(client.chat.completions.api_key, "ollama")
+            elif provider == "ast":
+                client = create_model_client(provider_override="ast")
+                self.assertIsNone(client)
+            else:
+                with patch.object(AppConfig, key_attr, token):
+                    self.assertEqual(_provider_api_key(provider), token)
+                    client = create_model_client(provider_override=provider)
+                    self.assertIsNotNone(client)
+                    self.assertEqual(client.chat.completions.base_url, expected_url)
+                    self.assertEqual(client.chat.completions.api_key, token)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,10 @@ _BUILTIN_TYPES = {
     "set": "set",
     "str": "str",
     "tuple": "tuple",
+    "List": "list",
+    "Dict": "dict",
+    "Set": "set",
+    "Tuple": "tuple",
 }
 _NUMERIC_TYPES = {"bool", "int", "float", "complex"}
 _SEQUENCE_TYPES = {"bytes", "list", "str", "tuple"}
@@ -74,16 +78,65 @@ def _shadowed_builtins(tree: ast.AST) -> set[str]:
     return shadowed
 
 
-def _annotation_type(annotation: ast.expr | None) -> TypeName:
-    """Resolve annotations only when they name a supported built-in type."""
+def _annotation_symbol(
+    annotation: ast.expr,
+    typing_modules: set[str],
+    typing_names: dict[str, str],
+) -> str | None:
     if isinstance(annotation, ast.Name):
-        return _BUILTIN_TYPES.get(annotation.id)
+        return typing_names.get(annotation.id, annotation.id)
+    if (
+        isinstance(annotation, ast.Attribute)
+        and isinstance(annotation.value, ast.Name)
+        and annotation.value.id in typing_modules
+    ):
+        return annotation.attr
+    return None
+
+
+def _annotation_type(
+    annotation: ast.expr | None,
+    typing_modules: set[str],
+    typing_names: dict[str, str],
+) -> TypeName:
+    """Resolve annotations only when they name a supported built-in type."""
+    if isinstance(annotation, (ast.Name, ast.Attribute)):
+        symbol = _annotation_symbol(annotation, typing_modules, typing_names)
+        return _BUILTIN_TYPES.get(symbol) if symbol is not None else None
     if isinstance(annotation, ast.Constant) and annotation.value is None:
         return "NoneType"
     if isinstance(annotation, ast.Subscript):
-        base = _annotation_type(annotation.value)
+        annotation_name = _annotation_symbol(
+            annotation.value, typing_modules, typing_names
+        )
+        if annotation_name == "Optional":
+            return _annotation_type(
+                annotation.slice, typing_modules, typing_names
+            )
+        base = (
+            _BUILTIN_TYPES.get(annotation_name)
+            if annotation_name is not None
+            else None
+        )
+        if base is None:
+            base = _annotation_type(
+                annotation.value, typing_modules, typing_names
+            )
         if base:
             return base
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        left_type = _annotation_type(
+            annotation.left, typing_modules, typing_names
+        )
+        right_type = _annotation_type(
+            annotation.right, typing_modules, typing_names
+        )
+        if left_type == "NoneType" and right_type:
+            return right_type
+        if right_type == "NoneType" and left_type:
+            return left_type
+        if left_type and right_type and left_type == right_type:
+            return left_type
     return None
 
 
@@ -168,6 +221,22 @@ class _TypeAnalyzer:
         self.tree = tree
         self.findings: list[TypeFinding] = []
         self.shadowed = _shadowed_builtins(tree)
+        self.typing_modules: set[str] = set()
+        self.typing_names: dict[str, str] = {}
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                self.typing_modules.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if alias.name == "typing"
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module == "typing":
+                self.typing_names.update(
+                    {
+                        alias.asname or alias.name: alias.name
+                        for alias in node.names
+                    }
+                )
 
     def _check_operation(
         self,
@@ -300,15 +369,21 @@ class _TypeAnalyzer:
                 )
                 for argument in all_arguments:
                     local_environment[argument.arg] = _annotation_type(
-                        argument.annotation
+                        argument.annotation,
+                        self.typing_modules,
+                        self.typing_names,
                     )
                 if statement.args.vararg:
                     local_environment[statement.args.vararg.arg] = _annotation_type(
-                        statement.args.vararg.annotation
+                        statement.args.vararg.annotation,
+                        self.typing_modules,
+                        self.typing_names,
                     )
                 if statement.args.kwarg:
                     local_environment[statement.args.kwarg.arg] = _annotation_type(
-                        statement.args.kwarg.annotation
+                        statement.args.kwarg.annotation,
+                        self.typing_modules,
+                        self.typing_names,
                     )
                 self._process_block(statement.body, local_environment)
                 environment.pop(statement.name, None)

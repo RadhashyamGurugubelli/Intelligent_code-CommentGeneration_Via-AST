@@ -12,7 +12,7 @@ from backend.assistant import (
 from backend.ast_analyzer import analyze_code
 from backend.attack_guard import detect_attack
 from backend.request_utils import undefined_name_findings
-from backend.model_provider import MODEL_NAME
+from backend import model_provider
 from backend.rules import summarize_quality
 from backend.validator import check_undefined_names, validate_code
 
@@ -105,7 +105,7 @@ def improve_code_quality(source_code, model_client):
 
     for _ in range(MAX_IMPROVEMENT_ITERATIONS):
         response = model_client.chat.completions.create(
-            model=MODEL_NAME,
+            model=model_provider.MODEL_NAME,
             messages=[
                 {
                     "role": "system",
@@ -129,7 +129,7 @@ def improve_code_quality(source_code, model_client):
             ],
             max_tokens=6000,
             temperature=0.1,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            extra_body=model_provider.provider_extra_body(),
         )
         try:
             candidate = _model_source(response)

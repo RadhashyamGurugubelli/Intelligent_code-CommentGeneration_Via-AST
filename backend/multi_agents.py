@@ -34,7 +34,7 @@ class BaseAgent:
 class CodeOptimizationAgent(BaseAgent):
     def __init__(self, model_client, model_name):
         system_prompt = (
-            "You are a Code Optimization Agent. Your goal is to analyze the provided Python code "
+            "You are FORGE, the Code Engineering Agent. Analyze the provided Python code "
             "and suggest performance improvements, identify potential bottlenecks, and "
             "refactor the code to improve readability and efficiency. Return ONLY the complete updated Python code block formatted as `python\n...code...\n` without any surrounding explanation."
         )
@@ -44,8 +44,8 @@ class CodeOptimizationAgent(BaseAgent):
 class CodeSecurityReviewAgent(BaseAgent):
     def __init__(self, model_client, model_name):
         system_prompt = (
-            "You are a Code Security Review Agent. Your goal is to analyze the provided Python code for "
-            "common security vulnerabilities (e.g., injections, insecure configurations, SSRF, XXE, ReDoS, weak hashing). "
+            "You are REMEDY, the Code Remediation Agent. Analyze the provided Python code for "
+            "common security vulnerabilities (e.g., injections, insecure configurations, SSRF, XXE, ReDoS, weak hashing) and apply safe fixes. "
             "Return ONLY the patched, secure version of the complete Python code formatted as `python\n...code...\n` without any surrounding explanation."
         )
         super().__init__(name="CodeSecurityReviewAgent", system_prompt=system_prompt, model_client=model_client, model_name=model_name)
@@ -54,7 +54,7 @@ class CodeSecurityReviewAgent(BaseAgent):
 class SecurityVerificationAgent(BaseAgent):
     def __init__(self, model_client, model_name):
         system_prompt = (
-            "You are a Security Verification & Audit Agent. Your goal is to verify that the provided "
+            "You are VERITY, the Quality & Verification Agent. Verify that the provided "
             "Python code is completely secure, functional, preserves all original function definitions, "
             "and contains no regressions or syntax errors. Return ONLY the finalized, verified Python code block formatted as `python\n...code...\n` without any surrounding explanation."
         )
@@ -64,7 +64,7 @@ class SecurityVerificationAgent(BaseAgent):
 class RedTeamAttackAgent(BaseAgent):
     def __init__(self, model_client, model_name):
         system_prompt = (
-            "You are a Red Team Attack Simulation Agent. Your goal is to inspect Python code for "
+            "You are SENTINEL, the Security Intelligence Agent. Inspect Python code for "
             "vulnerabilities (CWE-89 SQLi, CWE-78 Command Injection, CWE-22 Path Traversal, CWE-502 Deserialization, "
             "CWE-611 XXE, CWE-918 SSRF, CWE-1333 ReDoS, CWE-327 Broken Crypto, CWE-377 Tempfiles, CWE-215 Debug Mode) "
             "and produce exploit threat vectors."

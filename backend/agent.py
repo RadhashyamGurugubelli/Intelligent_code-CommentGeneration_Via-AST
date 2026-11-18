@@ -7,7 +7,7 @@ import re
 
 from backend.assistant import _contains_unsafe_execution
 from backend.attack_guard import detect_attack
-from backend.model_provider import MODEL_NAME
+from backend import model_provider
 from backend.rules import summarize_quality
 from backend.type_analyzer import find_definite_type_errors
 
@@ -192,11 +192,11 @@ def run_agent(source_code, task, analysis, model_client):
 
     for _ in range(MAX_AGENT_TOOL_CALLS + 1):
         response = model_client.chat.completions.create(
-            model=MODEL_NAME,
+            model=model_provider.MODEL_NAME,
             messages=messages,
             max_tokens=700,
             temperature=0.1,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            extra_body=model_provider.provider_extra_body(),
         )
         raw_decision = _model_text(response)
         decision = _parse_decision(raw_decision)

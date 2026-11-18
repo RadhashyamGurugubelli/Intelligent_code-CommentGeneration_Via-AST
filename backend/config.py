@@ -48,26 +48,39 @@ def _resolve_github_token():
     return ""
 
 
+def validate_api_key_strength(key: str) -> tuple[bool, str]:
+    """Validate that an API key meets enterprise entropy and complexity requirements."""
+    if not isinstance(key, str) or not key.strip():
+        return False, "API key cannot be empty."
+    clean_key = key.strip()
+    if len(clean_key) < 16:
+        return False, f"API key must be at least 16 characters long (got {len(clean_key)})."
+    trivial_fragments = ("changeme", "change-me", "password", "12345678", "secret", "admin", "apikey", "default")
+    if any(trivial in clean_key.lower() for trivial in trivial_fragments) or clean_key.lower().startswith("test_key"):
+        return False, "API key cannot be or contain a well-known trivial or default placeholder."
+    return True, "API key meets complexity requirements."
+
+
 class AppConfig:
-    DEBUG = _as_bool(os.getenv("FLASK_DEBUG", ""))
-    API_KEY = (
-        os.getenv("API_KEY", "").strip()
-        or os.getenv("OPENAI_API_KEY", "").strip()
-        or os.getenv("GEMINI_API_KEY", "").strip()
-        or os.getenv("GROQ_API_KEY", "").strip()
-        or os.getenv("ANTHROPIC_API_KEY", "").strip()
-        or os.getenv("COPILOT_TOKEN", "").strip()
-        or os.getenv("GITHUB_TOKEN", "").strip()
-        or os.getenv("GH_TOKEN", "").strip()
-        or _resolve_github_token()
-    )
+    ENVIRONMENT = os.getenv("ENVIRONMENT", os.getenv("FLASK_ENV", "development")).strip().lower()
+    IS_PRODUCTION = ENVIRONMENT in {"production", "prod", "live"}
+
+    DEBUG = False if IS_PRODUCTION else _as_bool(os.getenv("FLASK_DEBUG", ""))
+    # Separate application server access key from provider credentials
+    SERVER_API_KEY = os.getenv("SERVER_API_KEY", os.getenv("API_KEY", "")).strip()
+    API_KEY = SERVER_API_KEY
     AI_PROVIDER = os.getenv("AI_PROVIDER", "huggingface").strip().lower()
+    API_KEY_PROVIDER = AI_PROVIDER
     DOCSTRING_STYLE = os.getenv("DOCSTRING_STYLE", "google").strip().lower()
 
     # Hugging Face
+    HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
     HF_MODEL = os.getenv("HF_MODEL", "Qwen/Qwen3.5-35B-A3B").strip()
 
     # GitHub Copilot
+    COPILOT_TOKEN = os.getenv("COPILOT_TOKEN", "").strip()
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+    GH_TOKEN = os.getenv("GH_TOKEN", "").strip()
     COPILOT_MODEL = os.getenv("COPILOT_MODEL", "gpt-4o").strip() or "gpt-4o"
     COPILOT_BASE_URL = os.getenv(
         "COPILOT_BASE_URL", "https://api.githubcopilot.com"
@@ -108,9 +121,16 @@ class AppConfig:
     OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b").strip()
     OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "180"))
 
-    REQUIRE_API_KEY = _as_bool(os.getenv("REQUIRE_API_KEY", "false"))
+    # In production, default REQUIRE_API_KEY to True unless explicitly disabled
+    REQUIRE_API_KEY = (
+        True
+        if IS_PRODUCTION and "REQUIRE_API_KEY" not in os.environ
+        else _as_bool(os.getenv("REQUIRE_API_KEY", "false"))
+    )
     MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", str(1024 * 1024)))
     MAX_SOURCE_LENGTH = 50_000
+    AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "1500"))
+    AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "6"))
     CORS_ORIGINS = tuple(
         origin.strip()
         for origin in os.getenv("CORS_ORIGINS", "").split(",")
@@ -149,4 +169,3 @@ class AppConfig:
 
 
 SUPPORTED_PROVIDERS = AppConfig.SUPPORTED_PROVIDERS
-

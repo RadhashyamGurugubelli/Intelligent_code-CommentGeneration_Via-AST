@@ -1,10 +1,16 @@
-"""AI-driven and AST-grounded Code Security Attack Simulation Agent (Red Team)."""
+"""SENTINEL security intelligence with AST-grounded vulnerability analysis."""
 
 import ast
+import ipaddress
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from backend.attack_guard import detect_attack
+from backend.security_flows import (
+    find_dynamic_template_flows,
+    find_sql_source_evidence,
+)
 from backend.validator import validate_code
 
 _SQL_KEYWORDS = re.compile(
@@ -85,6 +91,161 @@ def _has_dynamic_sql_value(node: ast.AST) -> bool:
     return False
 
 
+def _find_augmented_sql_flows(
+    tree: ast.AST, source_code: str
+) -> list[dict[str, Any]]:
+    """Track SQL strings extended with dynamic values through execute sinks."""
+    lines = source_code.splitlines()
+    scopes = [tree]
+    scopes.extend(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+    findings = []
+
+    def scope_nodes(root):
+        class ScopeVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.nodes = []
+
+            def generic_visit(self, node):
+                self.nodes.append(node)
+                super().generic_visit(node)
+
+            def visit_FunctionDef(self, node):
+                self.nodes.append(node)
+                if node is root:
+                    for child in ast.iter_child_nodes(node):
+                        self.visit(child)
+
+            def visit_AsyncFunctionDef(self, node):
+                self.nodes.append(node)
+                if node is root:
+                    for child in ast.iter_child_nodes(node):
+                        self.visit(child)
+
+            def visit_ClassDef(self, node):
+                self.nodes.append(node)
+                if node is root:
+                    for child in ast.iter_child_nodes(node):
+                        self.visit(child)
+
+        visitor = ScopeVisitor()
+        visitor.visit(root)
+        return sorted(
+            visitor.nodes,
+            key=lambda item: (
+                getattr(item, "lineno", 0),
+                getattr(item, "col_offset", 0),
+            ),
+        )
+
+    def is_dynamic(node, literal_names):
+        if isinstance(node, ast.Constant):
+            return False
+        if isinstance(node, ast.Name):
+            return node.id not in literal_names
+        if isinstance(node, ast.JoinedStr):
+            return any(
+                is_dynamic(value.value, literal_names)
+                for value in node.values
+                if isinstance(value, ast.FormattedValue)
+            )
+        if isinstance(node, ast.Call):
+            call_text = ast.unparse(node.func).lower()
+            if call_text.startswith(("request.", "flask.request.")):
+                return True
+            return any(
+                is_dynamic(value, literal_names)
+                for value in node.args
+            ) or any(
+                is_dynamic(keyword.value, literal_names)
+                for keyword in node.keywords
+            )
+        if isinstance(node, ast.BinOp):
+            return is_dynamic(node.left, literal_names) or is_dynamic(
+                node.right, literal_names
+            )
+        if isinstance(node, ast.Attribute):
+            return is_dynamic(node.value, literal_names)
+        if isinstance(node, ast.Subscript):
+            return is_dynamic(node.value, literal_names) or is_dynamic(
+                node.slice, literal_names
+            )
+        return True
+
+    for scope in scopes:
+        nodes = scope_nodes(scope)
+        sql_names = set()
+        augmented_sql = {}
+        literal_names = set()
+
+        for node in nodes:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = node.value
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+                value_text = ast.unparse(value) if value is not None else ""
+                value_is_sql = bool(_SQL_KEYWORDS.search(value_text))
+                for target in targets:
+                    if not isinstance(target, ast.Name):
+                        continue
+                    name = target.id
+                    if value_is_sql:
+                        sql_names.add(name)
+                        augmented_sql.pop(name, None)
+                    elif isinstance(value, ast.Name) and value.id in sql_names:
+                        sql_names.add(name)
+                        if value.id in augmented_sql:
+                            augmented_sql[name] = list(augmented_sql[value.id])
+                    else:
+                        sql_names.discard(name)
+                        augmented_sql.pop(name, None)
+                    if isinstance(value, ast.Constant):
+                        literal_names.add(name)
+                    else:
+                        literal_names.discard(name)
+            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+                name = node.target.id
+                if (
+                    name in sql_names
+                    and isinstance(node.op, ast.Add)
+                    and is_dynamic(node.value, literal_names)
+                ):
+                    augmented_sql.setdefault(name, []).append(node)
+            elif isinstance(node, ast.Call):
+                if (
+                    not isinstance(node.func, ast.Attribute)
+                    or node.func.attr != "execute"
+                    or not node.args
+                    or not isinstance(node.args[0], ast.Name)
+                ):
+                    continue
+                query_name = node.args[0].id
+                updates = augmented_sql.get(query_name, [])
+                if not updates:
+                    continue
+                for update in updates:
+                    line_number = getattr(update, "lineno", 1)
+                    line_index = line_number - 1
+                    source_line = (
+                        lines[line_index]
+                        if 0 <= line_index < len(lines)
+                        else ast.unparse(update)
+                    )
+                    findings.append({
+                        "line": line_number,
+                        "sink_line": getattr(node, "lineno", line_number),
+                        "code": source_line.strip(),
+                        "expression": ast.unparse(update),
+                    })
+    return findings
+
+
 def _find_dynamic_sql(tree: ast.AST, source_code: str) -> list[dict[str, Any]]:
     """Detect SQL expressions that interpolate or concatenate non-literal values."""
     findings = []
@@ -109,6 +270,12 @@ def _find_dynamic_sql(tree: ast.AST, source_code: str) -> list[dict[str, Any]]:
             "code": source_line.strip(),
             "expression": text_repr,
         })
+
+    for finding in _find_augmented_sql_flows(tree, source_code):
+        key = (finding["line"], finding["expression"])
+        if key not in seen:
+            seen.add(key)
+            findings.append(finding)
     return findings
 
 
@@ -121,6 +288,8 @@ def _find_command_injections(tree: ast.AST, source_code: str) -> list[dict[str, 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             call_name = _canonical_call_name(node.func, aliases)
+            if call_name.startswith("builtins."):
+                call_name = call_name[len("builtins."):]
 
             if call_name in {"eval", "exec", "compile", "os.system", "os.popen"}:
                 line_idx = getattr(node, "lineno", 1) - 1
@@ -311,11 +480,14 @@ def _find_redos_patterns(tree: ast.AST, source_code: str) -> list[dict[str, Any]
     """Detect regular expressions vulnerable to polynomial or exponential ReDoS (CWE-1333)."""
     findings = []
     lines = source_code.splitlines()
+    aliases = _import_aliases(tree)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            call_text = ast.unparse(node.func)
-            if any(call_text.startswith(prefix) for prefix in ("re.", "regex.")):
+            call_text = _canonical_call_name(node.func, aliases)
+            if any(call_text.startswith(prefix) for prefix in ("re.", "regex.")) or call_text in {
+                "compile", "search", "match", "findall", "finditer", "sub", "subn"
+            }:
                 if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
                     pattern_str = node.args[0].value
                     if _is_vulnerable_regex(pattern_str):
@@ -344,27 +516,137 @@ def _find_redos_patterns(tree: ast.AST, source_code: str) -> list[dict[str, Any]
 
 
 def _find_ssrf(tree: ast.AST, source_code: str) -> list[dict[str, Any]]:
-    """Detect unvalidated variable URLs passed into outbound HTTP requests (CWE-918)."""
+    """Detect outbound requests whose destination is not statically constrained."""
     findings = []
     lines = source_code.splitlines()
     aliases = _import_aliases(tree)
+    literal_urls = {}
+    literal_host_sets = {}
+    for candidate in ast.walk(tree):
+        if isinstance(candidate, (ast.Assign, ast.AnnAssign)):
+            targets = (
+                candidate.targets
+                if isinstance(candidate, ast.Assign)
+                else [candidate.target]
+            )
+            value = candidate.value
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    literal_urls[target.id] = value.value
+                elif isinstance(value, (ast.Set, ast.List, ast.Tuple)) and all(
+                    isinstance(item, ast.Constant)
+                    and isinstance(item.value, str)
+                    for item in value.elts
+                ):
+                    literal_host_sets[target.id] = {
+                        item.value.lower().rstrip(".") for item in value.elts
+                    }
 
-    has_validation = any(
-        marker in source_code.lower()
-        for marker in (
-            "urlparse",
-            "validate_url",
-            "is_safe_url",
-            "allowed_hosts",
-            "whitelist",
-            "startswith(('http",
-            'startswith(("http',
-            "startswith('http",
-            'startswith("http',
-        )
-    )
-    if has_validation:
-        return []
+    def private_or_local_destination(url):
+        try:
+            host = urlsplit(url).hostname
+        except ValueError:
+            return True
+        if not host:
+            return True
+        host = host.lower().rstrip(".")
+        if host in {
+            "localhost",
+            "metadata.google.internal",
+            "metadata.azure.com",
+            "metadata",
+        } or host.endswith((".localhost", ".local", ".internal")):
+            return True
+        try:
+            return not ipaddress.ip_address(host.split("%", 1)[0]).is_global
+        except ValueError:
+            return False
+
+    def has_exact_host_allowlist_guard(function, url_expression, call):
+        if function is None:
+            return False
+        parsed_names = set()
+        for candidate in ast.walk(function):
+            if not isinstance(candidate, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = candidate.value
+            if not (
+                isinstance(value, ast.Call)
+                and _canonical_call_name(value.func, aliases)
+                in {
+                    "urllib.parse.urlparse",
+                    "urllib.parse.urlsplit",
+                    "urlparse",
+                    "urlsplit",
+                }
+                and value.args
+                and ast.dump(value.args[0]) == ast.dump(url_expression)
+            ):
+                continue
+            targets = (
+                candidate.targets
+                if isinstance(candidate, ast.Assign)
+                else [candidate.target]
+            )
+            parsed_names.update(
+                target.id for target in targets if isinstance(target, ast.Name)
+            )
+
+        for statement in getattr(function, "body", []):
+            if not isinstance(statement, ast.If):
+                continue
+            if getattr(statement, "end_lineno", statement.lineno) >= call.lineno:
+                continue
+            tests = [statement.test]
+            tests.extend(
+                node
+                for node in ast.walk(statement.test)
+                if isinstance(node, ast.Compare)
+            )
+            for test in tests:
+                if not (
+                    isinstance(test, ast.Compare)
+                    and len(test.ops) == 1
+                    and len(test.comparators) == 1
+                    and isinstance(test.left, ast.Attribute)
+                    and test.left.attr == "hostname"
+                    and isinstance(test.left.value, ast.Name)
+                    and test.left.value.id in parsed_names
+                ):
+                    continue
+                allowed_hosts = test.comparators[0]
+                allowed = (
+                    {
+                        item.value.lower().rstrip(".")
+                        for item in allowed_hosts.elts
+                    }
+                    if isinstance(allowed_hosts, (ast.Set, ast.List, ast.Tuple))
+                    and all(
+                        isinstance(item, ast.Constant)
+                        and isinstance(item.value, str)
+                        for item in allowed_hosts.elts
+                    )
+                    else literal_host_sets.get(allowed_hosts.id, set())
+                    if isinstance(allowed_hosts, ast.Name)
+                    else set()
+                )
+                if not allowed:
+                    continue
+                rejected_branch = (
+                    statement.body
+                    if isinstance(test.ops[0], ast.NotIn)
+                    else statement.orelse
+                    if isinstance(test.ops[0], ast.In)
+                    else []
+                )
+                if any(
+                    isinstance(item, (ast.Raise, ast.Return))
+                    for item in rejected_branch
+                ):
+                    return True
+        return False
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
@@ -374,17 +656,53 @@ def _find_ssrf(tree: ast.AST, source_code: str) -> list[dict[str, Any]]:
                 and node.func.attr in {"get", "post", "put", "delete", "head", "patch", "urlopen"}
                 and call_name.startswith(("requests.", "urllib.", "httpx."))
             ):
-                if node.args:
-                    first_arg = node.args[0]
-                    if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
-                        continue
-                    line_idx = getattr(node, "lineno", 1) - 1
-                    source_line = lines[line_idx] if 0 <= line_idx < len(lines) else call_name
-                    findings.append({
-                        "call": call_name,
-                        "line": getattr(node, "lineno", 1),
-                        "code": source_line.strip(),
-                    })
+                url_expression = (
+                    node.args[0]
+                    if node.args
+                    else next(
+                        (kw.value for kw in node.keywords if kw.arg == "url"),
+                        None,
+                    )
+                )
+                if url_expression is None:
+                    continue
+                literal_url = (
+                    url_expression.value
+                    if isinstance(url_expression, ast.Constant)
+                    and isinstance(url_expression.value, str)
+                    else literal_urls.get(url_expression.id, "")
+                    if isinstance(url_expression, ast.Name)
+                    else ""
+                )
+                if literal_url and not private_or_local_destination(literal_url):
+                    continue
+
+                containing_functions = [
+                    scope
+                    for scope in ast.walk(tree)
+                    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and scope.lineno <= node.lineno <= scope.end_lineno
+                ]
+                function = min(
+                    containing_functions,
+                    key=lambda scope: scope.end_lineno - scope.lineno,
+                    default=None,
+                )
+                guarded_by_allowlist = has_exact_host_allowlist_guard(
+                    function, url_expression, node
+                )
+                line_idx = getattr(node, "lineno", 1) - 1
+                source_line = (
+                    lines[line_idx] if 0 <= line_idx < len(lines) else call_name
+                )
+                findings.append({
+                    "call": call_name,
+                    "line": getattr(node, "lineno", 1),
+                    "code": source_line.strip(),
+                    "confidence": 0.55 if guarded_by_allowlist else 0.85,
+                    "status": "needs_review" if guarded_by_allowlist else "vulnerable",
+                    "allowlist_guard": guarded_by_allowlist,
+                })
     return findings
 
 
@@ -465,6 +783,282 @@ def _find_exposed_debug_mode(tree: ast.AST, source_code: str) -> list[dict[str, 
     return findings
 
 
+def _find_insecure_file_permissions(tree: ast.AST, source_code: str) -> list[dict[str, Any]]:
+    """Detect overly permissive file creation masks or chmod 0o777 (CWE-732)."""
+    findings = []
+    lines = source_code.splitlines()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func_name = ast.unparse(node.func)
+            if func_name in {"os.chmod", "chmod"}:
+                for arg in node.args[1:]:
+                    if (
+                        isinstance(arg, ast.Constant)
+                        and isinstance(arg.value, int)
+                        and (arg.value & 0o777) in {0o777, 0o666}
+                    ):
+                        line_idx = getattr(node, "lineno", 1) - 1
+                        code = lines[line_idx].strip() if 0 <= line_idx < len(lines) else ast.unparse(node)
+                        findings.append({
+                            "line": getattr(node, "lineno", 1),
+                            "code": code,
+                            "mode": oct(arg.value),
+                        })
+            elif func_name in {"os.umask", "umask"}:
+                if node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == 0:
+                    line_idx = getattr(node, "lineno", 1) - 1
+                    code = lines[line_idx].strip() if 0 <= line_idx < len(lines) else ast.unparse(node)
+                    findings.append({
+                        "line": getattr(node, "lineno", 1),
+                        "code": code,
+                        "mode": "0",
+                    })
+    return findings
+
+
+def _find_sensitive_log_exposure(tree: ast.AST, source_code: str) -> list[dict[str, Any]]:
+    """Detect credentials, tokens, or passwords logged or printed (CWE-532)."""
+    findings = []
+    lines = source_code.splitlines()
+    sensitive_words = re.compile(
+        r"\b(?:password|passwd|pwd|token|secret|api_key|credit_card|auth_token)\b",
+        re.IGNORECASE,
+    )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            call_name = ast.unparse(node.func)
+            if any(call_name.startswith(pfx) for pfx in ("logging.", "logger.", "log.", "print")):
+                args_text = " ".join(ast.unparse(arg) for arg in node.args)
+                if sensitive_words.search(args_text):
+                    line_idx = getattr(node, "lineno", 1) - 1
+                    code = lines[line_idx].strip() if 0 <= line_idx < len(lines) else ast.unparse(node)
+                    findings.append({
+                        "line": getattr(node, "lineno", 1),
+                        "code": code,
+                        "call": call_name,
+                        "leak_marker": args_text[:80],
+                    })
+    return findings
+
+
+def _find_authentication_weaknesses(tree: ast.AST, source_code: str) -> list[dict[str, Any]]:
+    """Detect hardcoded passwords used directly in equality checks (CWE-287)."""
+    findings = []
+    lines = source_code.splitlines()
+    auth_names = {"password", "passwd", "secret_key", "admin_password", "token", "auth_token"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            if isinstance(node.left, ast.Name) and node.left.id.lower() in auth_names:
+                for comparator in node.comparators:
+                    if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
+                        line_idx = getattr(node, "lineno", 1) - 1
+                        code = lines[line_idx].strip() if 0 <= line_idx < len(lines) else ast.unparse(node)
+                        findings.append({
+                            "line": getattr(node, "lineno", 1),
+                            "code": code,
+                            "variable": node.left.id,
+                        })
+    return findings
+
+
+def _find_toctou_race_conditions(tree: ast.AST, source_code: str) -> list[dict[str, Any]]:
+    """Detect Time-of-Check to Time-of-Use (TOCTOU) file race conditions (CWE-367)."""
+    findings = []
+    lines = source_code.splitlines()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            test_str = ast.unparse(node.test)
+            if any(m in test_str for m in ("os.path.exists", "os.path.isfile", "exists(")):
+                body_str = "\n".join(ast.unparse(stmt) for stmt in node.body)
+                if any(sink in body_str for sink in ("open(", "os.remove(", "os.unlink(", "os.rename(")):
+                    line_idx = getattr(node, "lineno", 1) - 1
+                    code = lines[line_idx].strip() if 0 <= line_idx < len(lines) else test_str
+                    findings.append({
+                        "line": getattr(node, "lineno", 1),
+                        "code": code,
+                        "check": test_str,
+                    })
+    return findings
+
+
+def _scenario_ast_evidence(
+    tree: ast.AST, scenario: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve each static finding to its source AST node and a review comment."""
+    line = scenario.get("target_line", 0)
+    line_nodes = [
+        node for node in ast.walk(tree) if getattr(node, "lineno", None) == line
+    ]
+    category = str(scenario.get("category", "")).lower()
+    aliases = _import_aliases(tree)
+    node_label = "ast.Module (no source-level AST node resolved)"
+    sink_symbol = None
+    sink_line = scenario.get("sink_line", line)
+
+    def call_symbol(call: ast.Call) -> str:
+        return _canonical_call_name(call.func, aliases)
+
+    calls = [node for node in line_nodes if isinstance(node, ast.Call)]
+    if "sql" in category:
+        dynamic_nodes = [
+            node
+            for node in line_nodes
+            if isinstance(node, (ast.JoinedStr, ast.BinOp))
+            or (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "format"
+            )
+        ]
+        dynamic_node = dynamic_nodes[0] if dynamic_nodes else None
+        if dynamic_node is None:
+            dynamic_node = next(
+                (
+                    node
+                    for node in line_nodes
+                    if isinstance(node, ast.AugAssign)
+                    and isinstance(node.op, ast.Add)
+                ),
+                None,
+            )
+        dynamic_names = set()
+        if dynamic_node is not None:
+            for parent in ast.walk(tree):
+                if (
+                    isinstance(parent, (ast.Assign, ast.AnnAssign))
+                    and getattr(parent, "lineno", None) == line
+                    and parent.value is not None
+                    and any(child is dynamic_node for child in ast.walk(parent.value))
+                ):
+                    targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+                    dynamic_names.update(
+                        target.id for target in targets if isinstance(target, ast.Name)
+                    )
+
+        sql_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "execute"
+            and (
+                node in calls
+                or getattr(node, "lineno", None) == sink_line
+                or any(
+                    isinstance(argument, ast.JoinedStr)
+                    or any(
+                        isinstance(child, ast.Name) and child.id in dynamic_names
+                        for child in ast.walk(argument)
+                    )
+                    for argument in node.args
+                )
+            )
+        ]
+        if dynamic_node is not None:
+            if isinstance(dynamic_node, ast.JoinedStr):
+                node_label = "ast.JoinedStr (f-string interpolation)"
+            elif isinstance(dynamic_node, ast.BinOp):
+                node_label = "ast.BinOp (dynamic SQL construction)"
+            elif isinstance(dynamic_node, ast.AugAssign):
+                node_label = "ast.AugAssign (dynamic SQL append)"
+            else:
+                node_label = "ast.Call (str.format SQL construction)"
+        elif calls:
+            node_label = "ast.Call"
+        if sql_calls:
+            sink_symbol = call_symbol(sql_calls[0])
+            node_label += f" -> ast.Call -> {sink_symbol}"
+            sink_line = getattr(sql_calls[0], "lineno", sink_line)
+    elif "template" in category or "cross-site scripting" in category:
+        template_call = next(
+            (
+                call
+                for call in calls
+                if call_symbol(call).endswith("render_template_string")
+            ),
+            None,
+        )
+        if template_call:
+            sink_symbol = call_symbol(template_call)
+            sink_line = getattr(template_call, "lineno", sink_line)
+            node_label = f"ast.Call -> {sink_symbol} (dynamic template rendering)"
+    elif "credential" in category:
+        assignment = next(
+            (node for node in line_nodes if isinstance(node, (ast.Assign, ast.AnnAssign))),
+            None,
+        )
+        if assignment is not None:
+            node_label = "ast.Assign (hardcoded credential)"
+            targets = (
+                assignment.targets
+                if isinstance(assignment, ast.Assign)
+                else [assignment.target]
+            )
+            sink_symbol = next(
+                (target.id for target in targets if isinstance(target, ast.Name)),
+                None,
+            )
+    elif "debug" in category or "information disclosure" in category:
+        debug_call = next(
+            (
+                call
+                for call in calls
+                if any(keyword.arg == "debug" for keyword in call.keywords)
+            ),
+            None,
+        )
+        if debug_call is not None:
+            sink_symbol = call_symbol(debug_call)
+            node_label = f"ast.Call -> {sink_symbol}(debug=True)"
+        else:
+            assignment = next(
+                (node for node in line_nodes if isinstance(node, ast.Assign)), None
+            )
+            if assignment is not None:
+                node_label = "ast.Assign (debug mode enabled)"
+                sink_symbol = next(
+                    (
+                        target.id
+                        for target in assignment.targets
+                        if isinstance(target, ast.Name)
+                    ),
+                    None,
+                )
+    elif calls:
+        call = calls[0]
+        sink_symbol = call_symbol(call)
+        has_shell_true = any(
+            keyword.arg == "shell"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in call.keywords
+        )
+        if sink_symbol.startswith("subprocess.") and has_shell_true:
+            node_label = f"ast.Call -> {sink_symbol}(shell=True)"
+        else:
+            node_label = f"ast.Call -> {sink_symbol}"
+    elif line_nodes:
+        node = next(
+            (item for item in line_nodes if isinstance(item, ast.Assign)),
+            line_nodes[0],
+        )
+        node_label = f"ast.{type(node).__name__}"
+
+    cwe_match = re.search(r"\bCWE-\d+\b", str(scenario.get("cwe", "")))
+    cwe_label = cwe_match.group(0) if cwe_match else "OWASP-LLM01"
+    mitigation = " ".join(str(scenario.get("mitigation", "")).split())
+    comment = (
+        f"# [AST-SEC {cwe_label}] {scenario.get('name', 'Potential security issue')}. "
+        f"{mitigation}"
+    )
+    return {
+        "ast_node_type": node_label,
+        "ast_sink_symbol": sink_symbol,
+        "ast_sink_line": sink_line,
+        "ast_security_comment": comment,
+    }
+
+
 def simulate_attacks(source_code: str, model_client: Any = None) -> dict[str, Any]:
     """Statically assess Python source without executing it or its inputs."""
     del model_client  # Retained for compatibility with existing agent callers.
@@ -492,9 +1086,56 @@ def simulate_attacks(source_code: str, model_client: Any = None) -> dict[str, An
                 f"Static analysis found dynamic SQL expression '{f['expression']}'. "
                 "No database connection or input payload was used."
             ),
-            "impact": "User-controlled values may alter a query if interpolated into SQL.",
+            "impact": (
+                "A parameter inserted into SQL text can alter query structure if an "
+                "untrusted caller controls it; the submitted source does not establish "
+                "the parameter's external origin."
+            ),
             "status": "vulnerable",
+            **({"sink_line": f["sink_line"]} if f.get("sink_line") else {}),
             "mitigation": "Use parameterized queries with placeholders (? or %s) instead of string formatting.",
+        })
+
+    # Dynamic templates built from request data bypass normal template autoescaping.
+    template_findings = find_dynamic_template_flows(tree, source_code)
+    for idx, finding in enumerate(template_findings, start=1):
+        scenarios.append({
+            "id": f"SIM-TPL-{idx:03d}",
+            "name": "Untrusted Data in Dynamic HTML Template",
+            "category": "HTML Injection / Template Injection",
+            "cwe": "CWE-79: Improper Neutralization of Input During Web Page Generation",
+            "severity": "high",
+            "risk_score": 88,
+            "target_line": finding["sink_line"],
+            "source_line": finding["source_line"],
+            "source": finding["source"],
+            "template_line": finding["template_line"],
+            "sink_line": finding["sink_line"],
+            "sink": finding["sink"],
+            "source_to_sink": (
+                f"Line {finding['source_line']} -> line {finding['template_line']} "
+                f"-> {finding['sink']} at line {finding['sink_line']}"
+            ),
+            "confidence": finding["confidence"],
+            "vulnerable_code": finding["code"],
+            "attack_payload": "Synthetic untrusted request-data marker (not executed)",
+            "simulation_trace": (
+                f"Static analysis traced {finding['source']} at line "
+                f"{finding['source_line']} into a dynamically constructed template "
+                f"at line {finding['template_line']}, then to "
+                f"{finding['sink']} at line {finding['sink_line']}. "
+                "The source was not executed."
+            ),
+            "impact": (
+                "Request data inserted into template source can become literal HTML "
+                "or template syntax, enabling reflected XSS and potentially server-side "
+                "template injection."
+            ),
+            "status": "vulnerable",
+            "mitigation": (
+                "Render a regular template with render_template('greet.html', name=name) "
+                "and let the template engine autoescape the context value."
+            ),
         })
 
     # 2. Dynamic Code / Shell Execution (CWE-78 / CWE-94)
@@ -664,23 +1305,35 @@ def simulate_attacks(source_code: str, model_client: Any = None) -> dict[str, An
     # 9. Server-Side Request Forgery (SSRF) (CWE-918)
     ssrf_findings = _find_ssrf(tree, source_code)
     for idx, f in enumerate(ssrf_findings, start=1):
+        guarded = f.get("allowlist_guard", False)
         scenarios.append({
             "id": f"SIM-SSRF-{idx:03d}",
-            "name": "Server-Side Request Forgery (SSRF)",
+            "name": (
+                "Potential SSRF (destination allowlist needs runtime verification)"
+                if guarded
+                else "Server-Side Request Forgery (SSRF)"
+            ),
             "category": "Server-Side Request Forgery",
             "cwe": "CWE-918: Server-Side Request Forgery (SSRF)",
-            "severity": "high",
-            "risk_score": 88,
+            "severity": "medium" if guarded else "high",
+            "risk_score": 60 if guarded else 88,
             "target_line": f["line"],
             "vulnerable_code": f["code"],
             "attack_payload": "Synthetic internal-destination marker (not executed)",
             "simulation_trace": (
-                f"Static analysis identified outbound HTTP request '{f['call']}' with dynamic unvalidated URL. "
-                "Destination is not verified against an allowlist."
+                f"Static analysis identified outbound HTTP request '{f['call']}'. "
+                + (
+                    "A call-site hostname allowlist is present, but static analysis cannot prove DNS results "
+                    "are restricted to public IP addresses."
+                    if guarded
+                    else "The dynamic destination is not constrained by a recognized call-site hostname allowlist."
+                )
+                + " No network request was made."
             ),
             "impact": "Attacker-controlled URLs allow internal network scanning or access to cloud metadata services.",
-            "status": "vulnerable",
-            "mitigation": "Validate target URLs against an allowlist of permitted domains/protocols, or use a strict URL validation wrapper.",
+            "status": f.get("status", "vulnerable"),
+            "confidence": f.get("confidence", 0.85),
+            "mitigation": "Use an explicit destination allowlist and validate every resolved address against loopback, private, link-local, reserved, and metadata ranges before connecting.",
         })
 
     # 10. Insecure Cryptographic Hashing (CWE-327)
@@ -746,6 +1399,90 @@ def simulate_attacks(source_code: str, model_client: Any = None) -> dict[str, An
             "mitigation": "Set debug=False or configure debug mode via environment variable (e.g., os.getenv('DEBUG', 'False').lower() == 'true').",
         })
 
+    # 13. Insecure File Permissions (CWE-732)
+    perm_findings = _find_insecure_file_permissions(tree, source_code)
+    for idx, f in enumerate(perm_findings, start=1):
+        scenarios.append({
+            "id": f"SIM-PERM-{idx:03d}",
+            "name": "Insecure File Permissions / Excessive Privilege",
+            "category": "Insecure File Permissions",
+            "cwe": "CWE-732: Incorrect Permission Assignment for Critical Resource",
+            "severity": "high",
+            "risk_score": 80,
+            "target_line": f["line"],
+            "vulnerable_code": f["code"],
+            "attack_payload": "Synthetic world-writable permission marker (not executed)",
+            "simulation_trace": (
+                f"Static analysis found overly permissive file mode '{f['mode']}'. "
+                "World-writable files allow unprivileged local users to tamper with application data."
+            ),
+            "impact": "Unrestricted file permissions allow unauthorized modification or execution by any local user.",
+            "mitigation": "Restrict file permissions using 0o600 for confidential files or 0o700 for directories.",
+        })
+
+    # 14. Sensitive Information Exposure in Logs (CWE-532)
+    log_findings = _find_sensitive_log_exposure(tree, source_code)
+    for idx, f in enumerate(log_findings, start=1):
+        scenarios.append({
+            "id": f"SIM-LOG-{idx:03d}",
+            "name": "Sensitive Information Exposure in Logs or Print",
+            "category": "Sensitive Information Exposure",
+            "cwe": "CWE-532: Insertion of Sensitive Information into Log File",
+            "severity": "medium",
+            "risk_score": 75,
+            "target_line": f["line"],
+            "vulnerable_code": f["code"],
+            "attack_payload": "Synthetic credential leakage marker (not executed)",
+            "simulation_trace": (
+                f"Static analysis found sensitive credential variable printed or logged: '{f['leak_marker']}'. "
+                "Logs are often stored in plain text or aggregated to shared monitoring tools."
+            ),
+            "impact": "Credentials written to application logs can be harvested by attackers or unauthorized staff.",
+            "mitigation": "Scrub or mask sensitive variables before logging, or use dedicated secret masking formatters.",
+        })
+
+    # 15. Authentication Weakness / Hardcoded Password Comparison (CWE-287)
+    auth_findings = _find_authentication_weaknesses(tree, source_code)
+    for idx, f in enumerate(auth_findings, start=1):
+        scenarios.append({
+            "id": f"SIM-AUTH-{idx:03d}",
+            "name": "Hardcoded Password in Authentication Logic",
+            "category": "Authentication Weakness",
+            "cwe": "CWE-287: Improper Authentication",
+            "severity": "critical",
+            "risk_score": 92,
+            "target_line": f["line"],
+            "vulnerable_code": f["code"],
+            "attack_payload": "Synthetic hardcoded authentication bypass marker (not executed)",
+            "simulation_trace": (
+                f"Static analysis identified direct comparison of variable '{f['variable']}' with a hardcoded literal. "
+                "Hardcoded credentials cannot be safely rotated without code deployment."
+            ),
+            "impact": "Anyone with access to the source code can authenticate without valid account credentials.",
+            "mitigation": "Verify passwords against salted hashes (e.g. bcrypt or argon2) stored securely in a database.",
+        })
+
+    # 16. Time-of-Check to Time-of-Use (TOCTOU) Race Condition (CWE-367)
+    toctou_findings = _find_toctou_race_conditions(tree, source_code)
+    for idx, f in enumerate(toctou_findings, start=1):
+        scenarios.append({
+            "id": f"SIM-TOCTOU-{idx:03d}",
+            "name": "Time-of-Check to Time-of-Use (TOCTOU) Race Condition",
+            "category": "Race Condition",
+            "cwe": "CWE-367: Time-of-check Time-of-use (TOCTOU) Race Condition",
+            "severity": "medium",
+            "risk_score": 70,
+            "target_line": f["line"],
+            "vulnerable_code": f["code"],
+            "attack_payload": "Synthetic filesystem race condition marker (not executed)",
+            "simulation_trace": (
+                f"Static analysis found check '{f['check']}' followed by a file operation. "
+                "The state of the file can change between the existence check and actual file operation."
+            ),
+            "impact": "Concurrent processes or symlink attacks can alter the file between check and access.",
+            "mitigation": "Use atomic operations or exception handling (EAFP: try/except FileNotFoundError) instead of pre-checking exists().",
+        })
+
     # 13. Separate prompt-injection findings from generic static code-security findings.
     attack_detection = detect_attack(source_code, content_type="code")
     if attack_detection["detected"]:
@@ -798,7 +1535,32 @@ def simulate_attacks(source_code: str, model_client: Any = None) -> dict[str, An
                 "mitigation": mitigation,
             })
 
-    total_checks = 13
+    for scenario in scenarios:
+        evidence = _scenario_ast_evidence(tree, scenario)
+        scenario.update(evidence)
+        scenario.setdefault("analysis_type", "static_ast")
+        scenario.setdefault("dynamically_verified", False)
+        scenario.setdefault("confidence", scenario.get("confidence", "high"))
+        scenario.setdefault("remediation", scenario.get("mitigation", "Review and fix finding."))
+        scenario.setdefault(
+            "affected_location",
+            {
+                "line": scenario.get("target_line", 1),
+                "code": scenario.get("vulnerable_code", ""),
+            },
+        )
+        if "sql" in str(scenario.get("category", "")).lower():
+            scenario.update(find_sql_source_evidence(tree, scenario["target_line"]))
+            if evidence.get("ast_sink_line"):
+                scenario["sink_line"] = evidence["ast_sink_line"]
+            scenario["source_to_sink"] = (
+                f"{scenario.get('source')} -> {scenario.get('ast_sink_symbol') or 'SQL execution'} "
+                f"at line {scenario.get('sink_line', scenario['target_line'])}"
+            )
+        elif "template" in str(scenario.get("category", "")).lower():
+            scenario["ast_sink_line"] = scenario["sink_line"]
+
+    total_checks = 14
     vulnerable_count = len(scenarios)
 
     if vulnerable_count == 0:

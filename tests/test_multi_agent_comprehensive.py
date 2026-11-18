@@ -35,6 +35,19 @@ class MultiAgentComprehensiveTests(unittest.TestCase):
         self.assertIn("?", fixed)
         self.assertEqual(validate_code(fixed), True)
 
+    def test_remediate_sql_injection_binds_all_values_for_non_cursor_receiver(self):
+        code = (
+            "def query(uid, name):\n"
+            "    query = f\"SELECT * FROM users WHERE id = {uid} AND name = '{name}'\"\n"
+            "    return db.execute(query)\n"
+        )
+        fixed, fixes = _remediate_sql_injection(code)
+
+        self.assertIn("id = ? AND name = ?", fixed)
+        self.assertIn("db.execute(query, (uid, name))", fixed)
+        self.assertEqual(len(fixes), 1)
+        self.assertEqual(validate_code(fixed), True)
+
     def test_remediate_command_injection_eval(self):
         code = "def calc(expr):\n    return eval(expr)\n"
         fixed, fixes = _remediate_command_injection(code)
@@ -115,8 +128,8 @@ class MultiAgentComprehensiveTests(unittest.TestCase):
     def test_remediate_ssrf(self):
         code = "import requests\ndef fetch(target_url):\n    return requests.get(target_url)\n"
         fixed, fixes = _remediate_ssrf(code)
-        self.assertTrue(len(fixes) > 0)
-        self.assertEqual(validate_code(fixed), True)
+        self.assertEqual(fixed, code)
+        self.assertEqual(fixes, [])
 
     # -------------------------------------------------------------
     # 2. COMPOUND MULTI-VULNERABILITY REMEDIATION

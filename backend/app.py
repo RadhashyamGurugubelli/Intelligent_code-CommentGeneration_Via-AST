@@ -1,25 +1,38 @@
 """Flask routes for Intelligent Code Comment Generation via AST."""
 
-import difflib
 import logging
 import os
 import secrets
+import time
 from io import BytesIO
+from urllib.parse import urlsplit
 
 from flask import Blueprint, Flask, current_app, jsonify, request, send_file, send_from_directory
 
 from .agent import AgentRunError, run_agent
-from .agentic.routes import agentic_routes
-from .multi_agent_orchestrator import run_multi_agent_workflow
+from .agentic.routes import (
+    agentic_model_ready,
+    agentic_routes,
+    refresh_agentic_model_client,
+    run_agentic_workflow_sync,
+)
+from .monitoring import metrics_collector, monitoring_routes
+from .project import project_routes
 from .professor_student_engine import ProfessorStudentOrchestrator
 from .optimization_agent import optimize_code
 from .security_attack_agent import simulate_attacks
 from .security_fixing_agent import fix_attack_vulnerabilities
+from .security_rate_limit import default_rate_limiter
+from .security_secrets import install_log_redaction
+from .security_ssrf import validate_url_against_ssrf
+from . import model_provider
 from .assistant import (
     AssistantModelError,
     UnsafeAISuggestionError,
     build_assistant_response,
     build_live_ai_suggestion,
+    classify_nexus_request,
+    validate_assistant_history,
 )
 from .attack_guard import detect_attack, evaluate_attack_suite
 from .code_analysis import (
@@ -29,13 +42,13 @@ from .code_analysis import (
     analyze_code,
     build_smart_ast_explanations,
     client,
+    _fallback_comment_code,
     validate_code,
 )
-from .code_improver import _definition_names, _warnings_for, improve_code_quality
+from .code_improver import improve_code_quality
 from .config import AppConfig
 from .editor_assist import editor_assist
 from .model_provider import (
-    MODEL_NAME,
     get_current_settings,
     provider_display_name,
     provider_ready,
@@ -131,6 +144,68 @@ def _request_data():
     return _parse_request_data(request)
 
 
+def _valid_provider_base_url(value):
+    try:
+        parsed = urlsplit(value)
+        if not (
+            parsed.scheme.lower() in {"http", "https"}
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+        ):
+            return False
+        is_safe, _ = validate_url_against_ssrf(value, allow_local=True)
+        return is_safe
+    except ValueError:
+        return False
+
+
+def _record_start_time():
+    request._start_time = time.time()
+
+
+def _enforce_rate_limit():
+    if request.method == "OPTIONS":
+        return None
+    if request.path in {"/health", "/health/live", "/health/ready", "/metrics", "/favicon.ico"}:
+        return None
+    client_ip = (
+        request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1")
+        .split(",")[0]
+        .strip()
+    )
+    is_limited, remaining, retry_after = default_rate_limiter.is_rate_limited(
+        client_ip, request.path
+    )
+    if is_limited:
+        return (
+            jsonify(
+                {
+                    "error": "Rate limit exceeded. Please slow down your requests.",
+                    "status": "rate_limited",
+                    "retry_after": retry_after,
+                }
+            ),
+            429,
+            {"Retry-After": str(int(retry_after) + 1)},
+        )
+    return None
+
+
+def _enforce_csrf():
+    if request.method in {"POST", "PUT", "DELETE", "PATCH"}:
+        origin = request.headers.get("Origin")
+        if origin:
+            allowed_origins = current_app.config.get("CORS_ORIGINS", ())
+            host_origin = f"{request.scheme}://{request.host}"
+            if allowed_origins and origin != host_origin and origin not in allowed_origins:
+                logger.warning("CSRF origin mismatch: origin=%s host=%s", origin, host_origin)
+                return jsonify({"error": "Cross-Origin request blocked by CSRF policy."}), 403
+    return None
+
+
 def _api_key_required():
     if not current_app.config.get("REQUIRE_API_KEY", False):
         return False
@@ -154,6 +229,7 @@ def _enforce_model_api_key():
         "/generate",
         "/assist/ai",
         "/assistant",
+        "/assistant/intent",
         "/assistant/improve",
         "/agent/run",
         "/agent/optimize",
@@ -162,11 +238,26 @@ def _enforce_model_api_key():
         "/agent/multi-agent-workflow",
         "/agent/professor-student",
         "/agentic/run",
+        "/agentic/action",
         "/open_ast_pdf",
         "/download_ast_pdf",
     }
-    if request.path not in protected_paths:
+    agentic_session_path = request.path.startswith(
+        ("/agentic/session/", "/agentic/stream/", "/agentic/cancel/")
+    ) or request.path == "/agentic/action"
+    is_project_path = request.path.startswith("/api/project/")
+    if request.path not in protected_paths and not agentic_session_path and not is_project_path:
         return None
+    if agentic_session_path:
+        has_session_token = bool(
+            request.headers.get("X-Session-Token")
+            or request.args.get("ticket")
+            or any(cookie_name.startswith("ast_session_") for cookie_name in request.cookies)
+            or (request.is_json and (request.get_json(silent=True) or {}).get("token"))
+            or (request.is_json and (request.get_json(silent=True) or {}).get("owner_token"))
+        )
+        if has_session_token:
+            return None
     if current_app.config.get("REQUIRE_API_KEY", False) and not (
         current_app.config.get("API_KEY") or ""
     ).strip():
@@ -214,7 +305,7 @@ def after_request(response):
         if origin in allowed_origins:
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Headers"] = (
-                "Content-Type,Authorization,X-API-Key"
+                "Content-Type,Authorization,X-API-Key,X-Session-Token"
             )
             response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
             response.headers.add("Vary", "Origin")
@@ -224,7 +315,29 @@ def after_request(response):
     response.headers.setdefault(
         "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
     )
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self';",
+    )
+    if current_app.config.get("IS_PRODUCTION") or request.is_secure:
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    start_time = getattr(request, "_start_time", None)
+    if start_time is not None:
+        metrics_collector.record_request(response.status_code, time.time() - start_time)
     return response
+
+
+def handle_internal_server_error(error):
+    logger.exception("Internal server error: %s", error)
+    return jsonify({
+        "error": "An internal server error occurred. Details have been logged securely.",
+        "status": "error",
+    }), 500
 
 
 def request_entity_too_large(error):
@@ -246,7 +359,8 @@ def health():
             "version": "2.0",
             "ai_available": ai_available,
             "ai_provider": provider_display_name(),
-            "ai_model": MODEL_NAME,
+            "ai_model": model_provider.MODEL_NAME,
+            "provider_status": model_provider.provider_connection_status()[0],
             "ast_pdf_available": graphviz_available(),
             "modules": [
                 "assistant",
@@ -258,6 +372,7 @@ def health():
                 "security_fixing_agent",
                 "multi_agent_orchestrator",
                 "multi_agents",
+                "professor_student_engine",
                 "ast_analyzer",
                 "code_improver",
                 "code_analysis",
@@ -288,13 +403,38 @@ def get_settings_route():
 def update_settings_route():
     """Update runtime provider, key, model, or docstring style."""
     data = _request_data()
+    provider = data.get("provider")
+    if provider is not None and (
+        not isinstance(provider, str)
+        or provider.strip().lower() not in AppConfig.SUPPORTED_PROVIDERS
+    ):
+        return jsonify({"error": "Unsupported AI provider."}), 400
+    for field in ("api_key", "model", "base_url", "docstring_style"):
+        if data.get(field) is not None and not isinstance(data[field], str):
+            return jsonify({"error": f"{field} must be a string."}), 400
+    base_url = data.get("base_url")
+    if base_url and (
+        len(base_url) > 2048 or not _valid_provider_base_url(base_url)
+    ):
+        return jsonify(
+            {"error": "Base URL must be a valid HTTP or HTTPS URL without credentials, query, or fragment."}
+        ), 400
+    docstring_style = data.get("docstring_style")
+    if docstring_style is not None and docstring_style.strip().lower() not in {
+        "google",
+        "sphinx",
+        "numpy",
+        "standard",
+    }:
+        return jsonify({"error": "Unsupported docstring style."}), 400
     updated = update_provider_settings(
-        provider=data.get("provider"),
+        provider=provider,
         api_key=data.get("api_key"),
         model=data.get("model"),
-        base_url=data.get("base_url"),
-        docstring_style=data.get("docstring_style"),
+        base_url=base_url,
+        docstring_style=docstring_style,
     )
+    refresh_agentic_model_client()
     return jsonify(updated)
 
 
@@ -302,12 +442,23 @@ def update_settings_route():
 def test_provider_route():
     """Test live connectivity to a model provider."""
     data = _request_data()
-    provider = data.get("provider") or AppConfig.AI_PROVIDER
+    provider = data.get("provider", AppConfig.AI_PROVIDER)
     api_key = data.get("api_key")
     model = data.get("model")
     base_url = data.get("base_url")
+    if not isinstance(provider, str) or provider.strip().lower() not in AppConfig.SUPPORTED_PROVIDERS:
+        return jsonify({"error": "Unsupported AI provider."}), 400
+    for field, value in (("api_key", api_key), ("model", model), ("base_url", base_url)):
+        if value is not None and not isinstance(value, str):
+            return jsonify({"error": f"{field} must be a string."}), 400
+    if base_url and (
+        len(base_url) > 2048 or not _valid_provider_base_url(base_url)
+    ):
+        return jsonify(
+            {"error": "Base URL must be a valid HTTP or HTTPS URL without credentials, query, or fragment."}
+        ), 400
     result = test_provider_connectivity(
-        provider=provider,
+        provider=provider.strip().lower(),
         api_key=api_key,
         model=model,
         base_url=base_url,
@@ -351,8 +502,13 @@ def security_simulate_custom_attack_route():
         try:
             sim_res = simulate_attacks(code)
             ast_findings = sim_res.get("attack_scenarios", [])
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception("Static security analysis failed during custom simulation")
+            return jsonify({
+                "error": "Static security analysis could not be completed.",
+                "status": "failed",
+                "error_type": type(exc).__name__,
+            }), 500
 
     matched_scenario = None
     for sc in ast_findings:
@@ -374,10 +530,18 @@ def security_simulate_custom_attack_route():
             matched_scenario = sc
             break
 
+    attack_type_matched = matched_scenario is not None
     if not matched_scenario and ast_findings:
         matched_scenario = ast_findings[0]
 
     detected = prompt_scan["detected"] or code_scan["detected"] or (matched_scenario is not None)
+
+    target_line = 0
+    vuln_code = ""
+    mitigation = "Implement strict input sanitization and parameterized queries."
+    trace = ""
+    cwe = "CWE-20: Improper Input Validation"
+    cvss = 5.3
 
     if matched_scenario:
         cwe = matched_scenario.get("cwe", "CWE-20: Improper Input Validation")
@@ -386,7 +550,7 @@ def security_simulate_custom_attack_route():
         vuln_code = matched_scenario.get("vulnerable_code", "")
         mitigation = matched_scenario.get("mitigation", "Implement strict input sanitization and parameterized queries.")
         trace = (
-            f"Static Red Team Analysis identified vulnerable sink at line {target_line}: '{vuln_code}'. "
+            f"SENTINEL static analysis identified a vulnerable sink at line {target_line}: '{vuln_code}'. "
             f"Payload '{payload}' targets this vulnerability pattern. {matched_scenario.get('simulation_trace', '')}"
         )
     elif prompt_scan["detected"]:
@@ -438,6 +602,122 @@ def security_simulate_custom_attack_route():
             mitigation = "Enforce allowlists and schema validation on all untrusted inputs."
             trace = f"Custom payload '{payload}' tested against AST model. No immediate critical exploit path detected in active source."
 
+    resolved_ast_nodes = [
+        {
+            "scenario_id": scenario.get("id"),
+            "line": scenario.get("target_line", 0),
+            "ast_node_type": scenario.get("ast_node_type"),
+            "ast_sink_symbol": scenario.get("ast_sink_symbol"),
+            "ast_security_comment": scenario.get("ast_security_comment"),
+            "matched": scenario is matched_scenario,
+        }
+        for scenario in ast_findings
+    ]
+    ast_sink_matched = matched_scenario is not None
+    static_match_status = (
+        "attack_type_ast_pattern_matched"
+        if attack_type_matched
+        else "source_ast_finding_payload_link_unresolved"
+        if ast_sink_matched
+        else "payload_signature_only"
+        if detected
+        else "no_static_match"
+    )
+    execution_notice = (
+        "Static AST simulation only: no payload, user code, shell command, database "
+        "query, network request, or filesystem operation was executed."
+    )
+    defense_comment = (
+        f"# [AST-DEFENSE] {mitigation}"
+        if ast_sink_matched
+        else (
+            "# [AST-DEFENSE] No source AST sink was resolved; "
+            f"{mitigation}"
+        )
+    )
+    ast_trace_steps = [
+        {
+            "step": 1,
+            "name": "AST Lexical & Token Scan",
+            "status": "completed",
+            "details": {
+                "description": "Guardrail inspection of payload and source-code tokens.",
+                "payload_detected": prompt_scan.get("detected", False),
+                "payload_categories": prompt_scan.get("categories", []),
+                "payload_reasons": prompt_scan.get("reasons", []),
+                "code_detected": code_scan.get("detected", False),
+                "code_categories": code_scan.get("categories", []),
+                "source_code_provided": bool(code),
+            },
+        },
+        {
+            "step": 2,
+            "name": "AST Node & Sink Resolution",
+            "status": "resolved" if ast_sink_matched else "unresolved",
+            "details": {
+                "description": "Resolved source AST nodes and sink symbols; line numbers refer to the submitted source.",
+                "resolved_nodes": resolved_ast_nodes,
+                "matched_line": target_line,
+                "matched_node_type": (
+                    matched_scenario.get("ast_node_type")
+                    if matched_scenario
+                    else None
+                ),
+                "matched_sink_symbol": (
+                    matched_scenario.get("ast_sink_symbol")
+                    if matched_scenario
+                    else None
+                ),
+            },
+        },
+        {
+            "step": 3,
+            "name": "Static Taint & Impact Analysis",
+            "status": "completed",
+            "details": {
+                "description": "Static pattern association only; this is not runtime taint propagation or exploit execution.",
+                "static_match_status": static_match_status,
+                "payload_interaction": (
+                    f"The attack type matched the static "
+                    f"{matched_scenario.get('category', 'detected')} AST sink pattern; "
+                    "the payload itself was not executed or dynamically traced."
+                    if attack_type_matched and matched_scenario
+                    else (
+                        "A source AST finding was selected for context, but a specific "
+                        "payload-to-sink association was not resolved."
+                        if matched_scenario
+                        else "No source AST sink was matched to the submitted payload."
+                    )
+                ),
+                "impact": (
+                    matched_scenario.get("impact")
+                    if matched_scenario
+                    else trace
+                ),
+                "cwe": cwe,
+                "cvss": cvss,
+                "code_execution": False,
+                "execution_notice": execution_notice,
+            },
+        },
+        {
+            "step": 4,
+            "name": "REMEDY AST Remediation & Comment",
+            "status": "recommendation_ready",
+            "details": {
+                "description": "Recommended defensive code change and AST security-comment specification; source code was not modified.",
+                "recommended_code_fix": mitigation,
+                "comment_specification": defense_comment,
+                "source_line": target_line if ast_sink_matched else None,
+                "warning_comment": (
+                    matched_scenario.get("ast_security_comment")
+                    if matched_scenario
+                    else None
+                ),
+            },
+        },
+    ]
+
     return jsonify({
         "status": "success",
         "payload": payload,
@@ -449,11 +729,12 @@ def security_simulate_custom_attack_route():
         "risk_score": int(cvss * 10),
         "cvss": cvss,
         "cwe": cwe,
-        "target_line": target_line if matched_scenario else 0,
-        "vulnerable_code": vuln_code if matched_scenario else "",
+        "target_line": target_line,
+        "vulnerable_code": vuln_code,
         "exploit_trace": trace,
         "mitigation": mitigation,
         "latency_ms": prompt_scan.get("detection_latency_ms", 1.2),
+        "ast_trace_steps": ast_trace_steps,
     })
 
 
@@ -542,6 +823,9 @@ def agent_optimize_route():
         return jsonify(optimize_code(code, model_client=client))
     except Exception as exc:
         logger.exception("Code optimization agent failed")
+        provider_error = _provider_error_response(exc)
+        if provider_error:
+            return provider_error
         return jsonify({"error": f"Code optimization agent failed: {exc}", "status": "failed"}), 500
 
 
@@ -570,6 +854,9 @@ def agent_simulate_attacks_route():
         return jsonify(simulate_attacks(code, model_client=client))
     except Exception as exc:
         logger.exception("Attack simulation agent failed")
+        provider_error = _provider_error_response(exc)
+        if provider_error:
+            return provider_error
         return jsonify({"error": f"Attack simulation agent failed: {exc}", "status": "failed"}), 500
 
 
@@ -598,6 +885,9 @@ def agent_fix_attacks_route():
         return jsonify(fix_attack_vulnerabilities(code, model_client=client))
     except Exception as exc:
         logger.exception("Attack fixing agent failed")
+        provider_error = _provider_error_response(exc)
+        if provider_error:
+            return provider_error
         return jsonify({"error": f"Attack fixing agent failed: {exc}", "status": "failed"}), 500
 
 
@@ -622,10 +912,110 @@ def agent_multi_agent_workflow_route():
             }
         ), 400
 
+    if not agentic_model_ready():
+        return jsonify({
+            "error": (
+                "A ready AI model provider is required for this workflow. "
+                "Configure and test a provider in Settings, then retry."
+            ),
+            "configuration_required": True,
+            "status": "blocked",
+        }), 503
+
     try:
-        return jsonify(run_multi_agent_workflow(code, model_client=client))
+        full_pipeline = bool(data.get("full_pipeline") or data.get("stages") == 6)
+        include_docstrings = bool(data.get("include_docstrings", False))
+        task = (
+            "Perform a comprehensive full end-to-end multi-agent optimization, "
+            "security defense, documentation, and non-regression audit."
+            if full_pipeline
+            else "Review code security and quality, and document public callables."
+            if include_docstrings
+            else "Review code security and quality."
+        )
+        result = run_agentic_workflow_sync(code, task, auto_approve=False)
+        task_results = result.get("results", [])
+        task_states = result.get("tasks", {})
+        stages = []
+        for item in task_results:
+            state = task_states.get(item.get("task_id"), {})
+            stages.append({
+                "stage": state.get("stage"),
+                "agent_id": item.get("agent_key"),
+                "agent_name": state.get("agent_name", item.get("agent_key")),
+                "status": item.get("status", "failed"),
+                "duration_ms": item.get("duration_ms", 0),
+                "findings_count": len(item.get("findings", [])),
+                "findings": item.get("findings", []),
+                "summary": item.get("summary", ""),
+                "details": item.get("summary", ""),
+                "execution_mode": item.get("execution_mode"),
+                "fallback_reason": item.get("fallback_reason"),
+                "code_modified": bool(state.get("candidate_proposed")),
+                "candidate_status": state.get("candidate_status"),
+            })
+        timeline = stages if full_pipeline else stages[:4]
+        if result.get("status") != "completed":
+            return jsonify({
+                **result,
+                "workflow": "multi_agent_collaboration",
+                "stages": stages,
+                "timeline": timeline,
+            }), 502
+
+        tool_observations = result.get("tool_observations", [])
+        security_checks = sum(
+            int(
+                observation.get("result", {})
+                .get("result", {})
+                .get("total_checks_run", 0)
+            )
+            for observation in tool_observations
+            if observation.get("tool") == "probe_security_vulnerabilities"
+        )
+        findings_remediated = sum(
+            int(
+                observation.get("result", {})
+                .get("result", {})
+                .get("neutralized_count", 0)
+            )
+            for observation in tool_observations
+            if observation.get("tool") == "synthesize_defensive_patch"
+        )
+        agents = {
+            stage["agent_id"]: {
+                "status": stage["status"],
+                "summary": stage["summary"],
+                "findings": stage["findings"],
+                "execution_mode": stage["execution_mode"],
+                "fallback_reason": stage["fallback_reason"],
+                "code_modified": stage["code_modified"],
+            }
+            for stage in stages
+        }
+        return jsonify({
+            **result,
+            "workflow": "multi_agent_collaboration",
+            "stages": stages,
+            "timeline": timeline,
+            "final_hardened_code": result.get("final_code", code),
+            "agents": agents,
+            "summary": {
+                "overall_health": (
+                    "Verified" if result.get("audit_passed") else "Review required"
+                ),
+                "audit_passed": result.get("audit_passed"),
+                "execution_mode": result.get("execution_mode"),
+                "model_call_count": result.get("model_call_count", 0),
+                "static_checks_run": security_checks,
+                "findings_remediated": findings_remediated,
+            },
+        })
     except Exception as exc:
         logger.exception("Multi-agent workflow failed")
+        provider_error = _provider_error_response(exc)
+        if provider_error:
+            return provider_error
         return jsonify({"error": f"Multi-agent workflow failed: {exc}", "status": "failed"}), 500
 
 
@@ -646,7 +1036,7 @@ def agent_professor_student_route():
         _log_blocked_attack("/agent/professor-student", attack_detection)
         return jsonify(
             {
-                "error": "Professor-Student review blocked by the security layer.",
+                "error": "Autonomous review was blocked by the security layer.",
                 "security_blocked": True,
                 "attack_detection": attack_detection,
             }
@@ -673,8 +1063,11 @@ def agent_professor_student_route():
         result = orchestrator.run(code)
         return jsonify(result)
     except Exception as exc:
-        logger.exception("Professor-Student continuous review loop failed")
-        return jsonify({"error": f"Professor-Student review failed: {exc}", "status": "failed"}), 500
+        logger.exception("Autonomous review cycle failed")
+        provider_error = _provider_error_response(exc)
+        if provider_error:
+            return provider_error
+        return jsonify({"error": f"Autonomous review failed: {exc}", "status": "failed"}), 500
 
 
 @analysis_routes.route("/analyze", methods=["POST"])
@@ -769,12 +1162,30 @@ def generate():
             }
         ), 400
 
+    docstring_style = data.get("docstring_style")
+    if docstring_style is not None and (
+        not isinstance(docstring_style, str)
+        or docstring_style.strip().lower() not in {
+            "google",
+            "sphinx",
+            "numpy",
+            "standard",
+        }
+    ):
+        return jsonify({"error": "Unsupported docstring style."}), 400
+    if isinstance(docstring_style, str):
+        docstring_style = docstring_style.strip().lower()
+
+    remediate_and_comment = data.get("remediate_and_comment", False)
+    if not isinstance(remediate_and_comment, bool):
+        return jsonify({"error": "remediate_and_comment must be a boolean."}), 400
+
     undefined = check_undefined_names(code)
     name_warnings = format_name_errors(undefined)
     name_findings = _undefined_name_findings(undefined)
 
     attack_detection = detect_attack(code, content_type="code")
-    if attack_detection["detected"]:
+    try:
         preflight = analyze_code(code)
         preflight_warnings = preflight["warnings"] + name_findings
         security_warnings = [
@@ -782,7 +1193,7 @@ def generate():
             for warning in preflight_warnings
             if warning["rule_id"].startswith("SEC")
         ]
-        if not security_warnings:
+        if attack_detection["detected"] and not security_warnings:
             security_warnings = [
                 {
                     "rule_id": "SEC006",
@@ -793,46 +1204,120 @@ def generate():
             ]
             preflight_warnings.extend(security_warnings)
         preflight["warnings"] = preflight_warnings
-        _log_blocked_attack("/generate", attack_detection)
-        q_summary = summarize_quality(preflight_warnings)
-        return jsonify(
-            {
-                "error": "Security risks detected. Fix the findings before generating comments. Source code was not executed.",
-                "security_blocked": True,
-                "execution_status": "not_executed",
-                "warnings": security_warnings,
-                "quality_summary": q_summary,
-                "quality_score": q_summary["score"],
-                "review_score": build_review_score(preflight_warnings),
-                "analysis": preflight,
-                "attack_detection": attack_detection,
-            }
-        ), 409
 
-    try:
-        preflight = analyze_code(code)
-        preflight_warnings = preflight["warnings"] + name_findings
-        security_warnings = [
-            warning
-            for warning in preflight_warnings
-            if warning["rule_id"].startswith("SEC")
-        ]
-        if security_warnings:
-            preflight["warnings"] = preflight_warnings
+        has_security_findings = bool(security_warnings) or bool(
+            attack_detection.get("detected")
+        )
+        if has_security_findings:
             q_summary = summarize_quality(preflight_warnings)
+            if not remediate_and_comment:
+                if attack_detection.get("detected"):
+                    _log_blocked_attack("/generate", attack_detection)
+                return jsonify(
+                    {
+                        "error": "Security risks detected. Fix the findings before generating comments. Source code was not executed.",
+                        "security_blocked": True,
+                        "execution_status": "not_executed",
+                        "warnings": security_warnings,
+                        "quality_summary": q_summary,
+                        "quality_score": q_summary["score"],
+                        "review_score": build_review_score(preflight_warnings),
+                        "analysis": preflight,
+                        "attack_detection": attack_detection,
+                        "preview_security_annotated_code": _fallback_comment_code(code),
+                    }
+                ), 409
+
+            fix_result = fix_attack_vulnerabilities(code, model_client=client)
+            hardened_code = fix_result.get("fixed_code")
+            if not isinstance(hardened_code, str) or validate_code(hardened_code) is not True:
+                return jsonify(
+                    {
+                        "error": "Security remediation did not produce valid Python code.",
+                        "security_blocked": True,
+                        "remediation_failed": True,
+                        "execution_status": "not_executed",
+                        "warnings": security_warnings,
+                    }
+                ), 422
+            verification = fix_result.get("verification", {})
+            if (
+                fix_result.get("remaining_vulnerabilities", 0) > 0
+                or verification.get("all_detected_static_findings_addressed") is False
+            ):
+                return jsonify(
+                    {
+                        "error": "Security remediation could not verify that all detected findings were addressed.",
+                        "security_blocked": True,
+                        "remediation_failed": True,
+                        "execution_status": "not_executed",
+                        "warnings": security_warnings,
+                        "security_fixes_applied": fix_result.get(
+                            "defensive_controls", []
+                        ),
+                        "security_remediation": {
+                            "status": fix_result.get("status"),
+                            "remaining_vulnerabilities": fix_result.get(
+                                "remaining_vulnerabilities"
+                            ),
+                            "verification": verification,
+                        },
+                    }
+                ), 422
+            pipeline_result = run_pipeline(
+                hardened_code,
+                docstring_style=docstring_style,
+                security_controls=fix_result.get("defensive_controls", []),
+            )
+            updated_analysis = pipeline_result["analysis"]
+            hardened_undefined = check_undefined_names(hardened_code)
+            hardened_name_warnings = format_name_errors(hardened_undefined)
+            hardened_name_findings = _undefined_name_findings(hardened_undefined)
+            updated_analysis["warnings"].extend(hardened_name_findings)
+            quality_summary = summarize_quality(updated_analysis["warnings"])
             return jsonify(
                 {
-                    "error": "Security risks detected. Fix the findings before generating comments. Source code was not executed.",
-                    "security_blocked": True,
+                    "commented_code": pipeline_result["commented_code"],
                     "execution_status": "not_executed",
-                    "warnings": security_warnings,
-                    "quality_summary": q_summary,
-                    "quality_score": q_summary["score"],
-                    "review_score": build_review_score(preflight_warnings),
-                    "analysis": preflight,
+                    "analysis": updated_analysis,
+                    "warnings": updated_analysis["warnings"],
+                    "quality_summary": quality_summary,
+                    "cc_summary": {
+                        "file_cc": updated_analysis["summary"]["file_cc"],
+                        "per_function": {
+                            item["name"]: item["complexity"]
+                            for item in updated_analysis["functions"]
+                        },
+                        "threshold": CC_THRESHOLD,
+                    },
+                    "validation": pipeline_result["validation"],
+                    "ai_status": pipeline_result["method"],
+                    "generation_notice": pipeline_result["generation_notice"],
+                    "smart_explanations": build_smart_ast_explanations(hardened_code),
+                    "prompt_payload": _build_prompt_payload(
+                        hardened_code, updated_analysis
+                    ),
+                    "quality_score": quality_summary["score"],
+                    "review_score": build_review_score(updated_analysis["warnings"]),
+                    "name_errors": hardened_name_warnings,
+                    "name_findings": hardened_name_findings,
+                    "original_code": code,
+                    "remediated_before_commenting": True,
+                    "security_fixes_applied": fix_result.get(
+                        "defensive_controls", []
+                    ),
+                    "security_remediation": {
+                        "status": fix_result.get("status"),
+                        "remaining_vulnerabilities": fix_result.get(
+                            "remaining_vulnerabilities"
+                        ),
+                        "verification": fix_result.get("verification", {}),
+                    },
+                    "original_security_warnings": security_warnings,
+                    "attack_detection": attack_detection,
                 }
-            ), 409
-        pipeline_result = run_pipeline(code, preflight)
+            )
+        pipeline_result = run_pipeline(code, preflight, docstring_style=docstring_style)
     except CommentGenerationError as exc:
         logger.warning("Comment generation failed: %s", exc)
         provider_error = _provider_error_response(exc.__cause__)
@@ -1087,6 +1572,15 @@ def assistant_route():
         return jsonify({"error": "Prompt must be a string"}), 400
     if len(prompt) > 4000:
         return jsonify({"error": "Prompt is too long"}), 413
+    response_mode = data.get("response_mode", "answer") if isinstance(data, dict) else "answer"
+    if not isinstance(response_mode, str) or response_mode not in {"answer", "explain", "debug"}:
+        return jsonify({"error": "response_mode must be answer, explain, or debug."}), 400
+    try:
+        history = validate_assistant_history(
+            data.get("history", []) if isinstance(data, dict) else []
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     attack_detection = _scan_assistant_input(prompt, code)
     if attack_detection["detected"]:
@@ -1115,7 +1609,14 @@ def assistant_route():
         analysis["warnings"].extend(name_findings)
         assistant_warning = None
         try:
-            assistant = build_assistant_response(analysis, prompt, client, code)
+            assistant = build_assistant_response(
+                analysis,
+                prompt,
+                client,
+                code,
+                history=history,
+                response_mode=response_mode,
+            )
         except AssistantModelError as exc:
             if client is None:
                 raise
@@ -1123,7 +1624,14 @@ def assistant_route():
                 "AI assistant model response failed (%s); returning AST-grounded guidance.",
                 type(exc).__name__,
             )
-            assistant = build_assistant_response(analysis, prompt, None, code)
+            assistant = build_assistant_response(
+                analysis,
+                prompt,
+                None,
+                code,
+                history=history,
+                response_mode=response_mode,
+            )
             assistant_warning = (
                 "The configured AI provider could not provide a usable response; this uses "
                 "AST-grounded guidance instead."
@@ -1145,6 +1653,17 @@ def assistant_route():
         if provider_error:
             return provider_error
         return jsonify({"error": "AI assistant request failed"}), 500
+
+
+@assistant_routes.route("/assistant/intent", methods=["POST"])
+def assistant_intent_route():
+    data = _request_data()
+    prompt = data.get("prompt") if isinstance(data, dict) else None
+    if not isinstance(prompt, str) or not prompt.strip():
+        return jsonify({"error": "Prompt must contain at least one character."}), 400
+    if len(prompt) > 4000:
+        return jsonify({"error": "Prompt is too long."}), 413
+    return jsonify({"intent": classify_nexus_request(prompt)})
 
 
 @assistant_routes.route("/assistant/improve", methods=["POST"])
@@ -1247,6 +1766,7 @@ def _ast_pdf_response(*, as_attachment):
 
 def create_app(config_overrides=None):
     """Build a Flask application with the API route groups and shared middleware."""
+    install_log_redaction()
     flask_app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
     flask_app.config.from_object(AppConfig)
     if config_overrides:
@@ -1261,12 +1781,18 @@ def create_app(config_overrides=None):
         assistant_routes,
         artifact_routes,
         agentic_routes,
+        project_routes,
+        monitoring_routes,
     ):
         flask_app.register_blueprint(blueprint)
 
+    flask_app.before_request(_record_start_time)
+    flask_app.before_request(_enforce_rate_limit)
+    flask_app.before_request(_enforce_csrf)
     flask_app.before_request(_enforce_model_api_key)
     flask_app.after_request(after_request)
     flask_app.register_error_handler(413, request_entity_too_large)
+    flask_app.register_error_handler(500, handle_internal_server_error)
     return flask_app
 
 

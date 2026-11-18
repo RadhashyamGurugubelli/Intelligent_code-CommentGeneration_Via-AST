@@ -34,6 +34,10 @@ def synthesize_optimization_handler(args: Dict[str, Any], context: Any) -> Dict[
     code = _resolve_code(args, context)
     model_client = getattr(context, "model_client", None) if context else None
     result = optimize_code(code, model_client=model_client)
+    mode = result.get("mode", "deterministic_ast")
+    model_configured = bool(
+        model_client is not None and getattr(model_client, "chat", None)
+    )
     return {
         "optimized": result.get("optimized", False),
         "optimized_code": result.get("optimized_code", code),
@@ -41,4 +45,14 @@ def synthesize_optimization_handler(args: Dict[str, Any], context: Any) -> Dict[
         "complexity_after": result.get("complexity_after", "N/A"),
         "estimated_speedup": result.get("estimated_speedup", "1.0x"),
         "optimizations_applied": result.get("optimizations_applied", []),
+        "patches": result.get("patches", []),
+        "diff": result.get("diff", ""),
+        "execution_mode": "model" if mode == "ai" else "deterministic",
+        "fallback_reason": (
+            None
+            if mode == "ai"
+            else "model_candidate_unavailable_or_rejected"
+            if model_configured
+            else "model_provider_unavailable"
+        ),
     }

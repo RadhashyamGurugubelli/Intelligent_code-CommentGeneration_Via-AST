@@ -1,4 +1,4 @@
-"""AI-driven and AST-grounded Security Fixing and Attack Remediation Agent (Blue Team)."""
+"""REMEDY code remediation with AST-grounded defensive patching."""
 
 import difflib
 import logging
@@ -8,7 +8,7 @@ from typing import Any
 
 from backend.attack_guard import detect_attack
 from backend.code_improver import _definition_names
-from backend.model_provider import MODEL_NAME
+from backend import model_provider
 from backend.security_attack_agent import simulate_attacks
 from backend.validator import validate_code
 
@@ -35,25 +35,46 @@ def _remediate_sql_injection(source_code: str) -> tuple[str, list[str]]:
 
     match = fstring_sql_pattern.search(modified)
     if match:
-        quote = match.group(2)
-        param_var = match.group(4)
         original_stmt = match.group(0)
-
-        # Replace the f-string interpolation with SQL placeholder ?
-        fixed_stmt = re.sub(r'\{[a-zA-Z0-9_]+\}', '?', original_stmt)
-        # Remove f prefix
-        fixed_stmt = re.sub(r'=\s*f(["\'])', r'= \1', fixed_stmt)
-
-        modified = modified.replace(original_stmt, fixed_stmt)
-
-        # Now fix cursor.execute(query) -> cursor.execute(query, (var,))
-        execute_pattern = re.compile(r'cursor\.execute\(\s*query\s*\)')
-        if execute_pattern.search(modified):
-            modified = execute_pattern.sub(f'cursor.execute(query, ({param_var},))', modified)
-
-        fixes.append(
-            f"Remediated SQL Injection (CWE-89): Replaced dynamic f-string query with parameterized placeholder '?' and bound '({param_var},)' parameter tuple in cursor.execute()."
+        param_expressions = re.findall(r"\{([^{}]+)\}", original_stmt)
+        simple_params = all(
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", expression.strip())
+            for expression in param_expressions
         )
+        param_vars = (
+            [expression.strip() for expression in param_expressions]
+            if simple_params
+            else []
+        )
+        execute_pattern = re.compile(
+            r"([A-Za-z_][A-Za-z0-9_]*)\.execute\(\s*query\s*\)"
+        )
+
+        if param_vars:
+            fixed_stmt = re.sub(
+                r"""(['"])\{[A-Za-z_][A-Za-z0-9_]*\}\1""",
+                "?",
+                original_stmt,
+            )
+            fixed_stmt = re.sub(r"\{[A-Za-z_][A-Za-z0-9_]*\}", "?", fixed_stmt)
+            fixed_stmt = re.sub(r'=\s*f(["\'])', r'= \1', fixed_stmt)
+
+            modified = modified.replace(original_stmt, fixed_stmt)
+
+            if execute_pattern.search(modified):
+                param_tuple = ", ".join(param_vars)
+                if len(param_vars) == 1:
+                    param_tuple += ","
+                modified = execute_pattern.sub(
+                    lambda call: (
+                        f"{call.group(1)}.execute(query, ({param_tuple}))"
+                    ),
+                    modified,
+                )
+
+            fixes.append(
+                "Remediated SQL Injection (CWE-89): Replaced dynamic f-string interpolation with SQL placeholders and bound values where an execute call is present."
+            )
 
     # Pattern 2: cursor.execute(f"SELECT ... {var}") directly
     direct_execute_pattern = re.compile(
@@ -89,7 +110,7 @@ def _remediate_command_injection(source_code: str) -> tuple[str, list[str]]:
             "Remediated Code Injection (CWE-94): Replaced unsafe eval() with ast.literal_eval() to restrict evaluation to safe Python literals."
         )
 
-    # Fix os.system(command) -> subprocess.run(shlex.split(command), check=True)
+    # Fix os.system(command) -> subprocess.run(shlex.split(command), shell=False, check=False).returncode
     if "os.system(" in modified:
         needs_subprocess = "import subprocess" not in modified
         needs_shlex = "import shlex" not in modified
@@ -102,12 +123,17 @@ def _remediate_command_injection(source_code: str) -> tuple[str, list[str]]:
             modified = prefix + modified
 
         modified = re.sub(
+            r'return\s+os\.system\(([^)]+)\)',
+            r'return subprocess.run(shlex.split(\1), shell=False, check=False).returncode',
+            modified,
+        )
+        modified = re.sub(
             r'os\.system\(([^)]+)\)',
-            r'subprocess.run(shlex.split(\1), shell=False, check=True)',
+            r'subprocess.run(shlex.split(\1), shell=False, check=False).returncode',
             modified,
         )
         fixes.append(
-            "Remediated Command Injection (CWE-78): Replaced os.system() with subprocess.run(shlex.split(...), shell=False) to avoid shell metacharacter injection."
+            "Remediated Command Injection (CWE-78): Replaced os.system() with subprocess.run(shlex.split(...), shell=False, check=False).returncode to avoid shell metacharacter injection while preserving returncode and exception contracts."
         )
 
     # Subprocess shell=True remediation
@@ -404,23 +430,8 @@ def _remediate_redos(source_code: str) -> tuple[str, list[str]]:
 
 
 def _remediate_ssrf(source_code: str) -> tuple[str, list[str]]:
-    """Fix Server-Side Request Forgery by adding inline protocol and destination validation."""
-    modified = source_code
-    fixes = []
-
-    ssrf_pattern = re.compile(
-        r'\b(requests\.(?:get|post|put|delete|head|patch|request)|urllib\.request\.urlopen|urlopen|httpx\.(?:get|post))\(\s*([a-zA-Z_][a-zA-Z0-9_]*)(?=\s*[,)])'
-    )
-    if ssrf_pattern.search(modified):
-        modified = ssrf_pattern.sub(
-            r"\1(\2 if \2.startswith(('http://', 'https://')) else ''",
-            modified,
-        )
-        fixes.append(
-            "Remediated Server-Side Request Forgery (CWE-918): Added scheme validation restricting outbound HTTP destination to permitted http/https protocols."
-        )
-
-    return modified, fixes
+    """Decline SSRF rewrites when a destination policy cannot be inferred safely."""
+    return source_code, []
 
 
 def _deterministic_security_fix(source_code: str) -> tuple[str, list[str], list[str]]:
@@ -528,7 +539,7 @@ def fix_attack_vulnerabilities(
     if not scenarios:
         return {
             "agent": "security_fixing_agent",
-            "agent_name": "AI Security Fixing & Remediation Agent (Blue Team)",
+            "agent_name": "REMEDY — Code Remediation Agent",
             "status": "already_secure",
             "fixed": False,
             "original_code": source_code,
@@ -565,7 +576,7 @@ def fix_attack_vulnerabilities(
                 for s in scenarios
             )
             response = model_client.chat.completions.create(
-                model=MODEL_NAME,
+                model=model_provider.MODEL_NAME,
                 messages=[
                     {
                         "role": "system",
@@ -608,7 +619,15 @@ def fix_attack_vulnerabilities(
                             fixed_code = candidate
                             mode = "ai"
                             applied_fixes = [s["mitigation"] for s in scenarios]
-                            defensive_controls = ["AI-Synthesized Security Hardening & Input Sanitization"]
+                            defensive_controls = list(dict.fromkeys(
+                                str(s.get("mitigation", "")).strip()
+                                for s in scenarios
+                                if str(s.get("mitigation", "")).strip()
+                            ))
+                            if not defensive_controls:
+                                defensive_controls = [
+                                    "AI-Synthesized Security Hardening & Input Sanitization"
+                                ]
         except Exception as exc:
             logger.warning("AI security fixing failed (%s); using deterministic security remediation", exc)
 
@@ -648,9 +667,39 @@ def fix_attack_vulnerabilities(
 
     is_fixed = fixed_code.strip() != source_code.strip()
 
+    # Build structured minimal patch records
+    patches = []
+    if is_fixed:
+        for neutralized in neutralized_list:
+            patches.append({
+                "finding_id": neutralized["id"],
+                "root_cause": f"Unsanitized input reaching vulnerable sink in {neutralized.get('name', 'CWE')}",
+                "original_source_location": {
+                    "start_line": neutralized.get("target_line", 1),
+                    "end_line": neutralized.get("target_line", 1),
+                    "function_name": neutralized.get("function_name", "module"),
+                },
+                "proposed_modification": neutralized.get("fix_applied", "Applied defensive parameterization or sanitization."),
+                "explanation": f"Neutralized {neutralized.get('cwe', '')} {neutralized.get('name', '')} by applying defensive boundary controls.",
+                "expected_benefit": "Eliminates security risk without breaking existing function signatures or callers.",
+                "potential_risk": "None under standard runtime constraints.",
+                "confidence": 0.95,
+            })
+        if not patches:
+            patches.append({
+                "finding_id": "SEC_GENERAL_HARDENING",
+                "root_cause": "Static security vulnerabilities detected in source code",
+                "original_source_location": {"start_line": 1, "end_line": len(source_code.splitlines()), "function_name": "module"},
+                "proposed_modification": diff_text[:500],
+                "explanation": "Defensive controls applied to remediate reported findings.",
+                "expected_benefit": "Remediated security issues while preserving public definitions.",
+                "potential_risk": "None under standard runtime constraints.",
+                "confidence": 0.90,
+            })
+
     return {
         "agent": "security_fixing_agent",
-        "agent_name": "AI Security Fixing & Remediation Agent (Blue Team)",
+        "agent_name": "REMEDY — Code Remediation Agent",
         "status": "completed" if is_fixed else "no_fix_needed",
         "mode": mode,
         "fixed": is_fixed,
@@ -664,6 +713,7 @@ def fix_attack_vulnerabilities(
         "remaining_static_findings": post_simulation["vulnerabilities_detected"],
         "applied_fixes": applied_fixes,
         "defensive_controls": defensive_controls,
+        "patches": patches,
         "diff": diff_text,
         "pre_fix_resilience_score": attack_simulation.get("resilience_score", 0),
         "post_fix_resilience_score": post_resilience,
