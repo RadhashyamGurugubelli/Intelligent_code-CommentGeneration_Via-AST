@@ -29,7 +29,7 @@ IGNORED_DIRS = {
     "build",
     "dist",
     "tests",
-    "sample example",
+    "samples",
 }
 
 SCANNED_EXTENSIONS = {

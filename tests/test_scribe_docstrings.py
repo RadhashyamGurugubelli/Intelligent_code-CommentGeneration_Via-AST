@@ -58,7 +58,7 @@ GOLDEN_SAMPLES = [
 
 @pytest.mark.parametrize("sample_name", GOLDEN_SAMPLES)
 def test_golden_samples_compile_and_preserve_executable_ast(sample_name: str) -> None:
-    sample_path = Path("sample example") / sample_name
+    sample_path = Path("samples") / sample_name
     original_code = sample_path.read_text(encoding="utf-8")
 
     registry = create_standard_tool_registry()

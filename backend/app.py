@@ -349,6 +349,12 @@ def index():
     return send_from_directory(FRONTEND_DIR, "index.html")
 
 
+@main_routes.route("/script.js")
+def legacy_script():
+    """Backward-compatible route serving workbench.js to legacy client requests."""
+    return send_from_directory(FRONTEND_DIR, "workbench.js")
+
+
 @main_routes.route("/health", methods=["GET"])
 def health():
     ai_available = provider_ready(client)

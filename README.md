@@ -207,7 +207,7 @@ In the interest of rigorous academic evaluation, the following architectural bou
 ## 11. Academic Evaluation & Demonstration Scripts
 
 - **Evaluation Benchmark & Report:** See [AST_Studio_End_Project_Report.pdf](AST_Studio_End_Project_Report.pdf) for the complete academic research documentation, empirical benchmarks, and system evaluations. Re-run sample benchmarks anytime with `python scripts/evaluate_samples.py`.
-- **Visual Assets & Verification:** See [SCREENSHOTS&IMAGES/](SCREENSHOTS&IMAGES/) for high-resolution white-theme application screenshots and performance graphs.
+- **Visual Assets & Verification:** See [screenshots/](screenshots/) for high-resolution white-theme application screenshots and performance graphs.
 - **Academic Packaging:** Generate a pristine, sanitized submission package containing strictly `git ls-files` with zero credentials, virtual environments, or temporary artifacts:
   ```powershell
   python scripts/build_clean_submission.py

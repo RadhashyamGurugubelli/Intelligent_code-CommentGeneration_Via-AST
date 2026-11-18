@@ -27,7 +27,7 @@ from backend.validator import validate_generated_code
 
 
 def evaluate_samples() -> list[dict[str, any]]:
-    sample_dir = ROOT_DIR / "sample example"
+    sample_dir = ROOT_DIR / "samples"
     sample_files = sorted([f for f in os.listdir(sample_dir) if f.endswith(".py")])
 
     results = []
@@ -85,7 +85,7 @@ def generate_evaluation_markdown(results: list[dict[str, any]]) -> str:
     md_lines = [
         "# Reproducible Evaluation Report",
         "",
-        "This evaluation verifies AST Studio's deterministic parsing, security scanning, docstring generation, and syntax validation across the curated suite in `sample example/`.",
+        "This evaluation verifies AST Studio's deterministic parsing, security scanning, docstring generation, and syntax validation across the curated suite in `samples/`.",
         "",
         "> **To reproduce this evaluation locally:**",
         "> ```bash",

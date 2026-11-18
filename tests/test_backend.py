@@ -12,7 +12,7 @@ from backend.validator import has_added_comments
 
 class BackendContractTests(unittest.TestCase):
     def load_sample(self, filename):
-        sample_path = Path(__file__).resolve().parents[1] / "sample example" / filename
+        sample_path = Path(__file__).resolve().parents[1] / "samples" / filename
         return sample_path.read_text(encoding="utf-8")
 
     def test_provider_error_classifier_is_provider_neutral(self):
@@ -89,11 +89,14 @@ class BackendContractTests(unittest.TestCase):
         with app.test_client() as http_client:
             stylesheet = http_client.get("/styles.css")
             script = http_client.get("/script.js")
+            workbench = http_client.get("/workbench.js")
 
         self.assertEqual(stylesheet.status_code, 200)
         self.assertEqual(script.status_code, 200)
+        self.assertEqual(workbench.status_code, 200)
         stylesheet.close()
         script.close()
+        workbench.close()
 
     def test_agentic_status_reports_actual_runtime_and_specialist_configuration(self):
         from backend.app import app

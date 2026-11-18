@@ -237,6 +237,8 @@ class FrontendAssetIntegrationTests(unittest.TestCase):
         self.assertIn("editorHighlight.scrollLeft = editor.scrollLeft;", script)
 
     def test_script_js_loads_successfully(self):
+        response_wb = self.client.get("/workbench.js")
+        self.assertEqual(response_wb.status_code, 200)
         response = self.client.get("/script.js")
         self.assertEqual(response.status_code, 200)
         content = response.data.decode("utf-8")

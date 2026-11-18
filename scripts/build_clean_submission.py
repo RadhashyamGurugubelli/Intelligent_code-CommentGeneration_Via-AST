@@ -125,7 +125,7 @@ def build_clean_submission(output_zip: Path | None = None) -> Path:
                 findings = detect_secrets(content, filename=rel_path)
                 if findings:
                     norm_p = rel_path.replace("\\", "/")
-                    if norm_p.startswith("tests/") or norm_p.startswith("sample example/"):
+                    if norm_p.startswith("tests/") or norm_p.startswith("samples/"):
                         # Deliberate test vectors / security benchmarks
                         pass
                     else:
